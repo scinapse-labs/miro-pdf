@@ -39,21 +39,22 @@ impl PageLayout {
         let pages = doc.pages()?;
         let vsize: Vector<_> = viewport.into();
         let effective_scale = scale * fractional_scale;
-        // FIX: This doesn't quite work for pdfs with different page sizes like
-        // assets/multiple-page-layouts.pdf. A page needs to be offset by its own size (and depend
-        // on all previous sizes), not the prior page.
         match self {
             PageLayout::SinglePage => {
                 let mut pos: Vector<f32> = Vector::zero();
-                for page in pages.flatten() {
+                let mut prev_bounds = Rect::default();
+                for (i, page) in pages.flatten().enumerate() {
                     let mut bounds: Rect<f32> = page.bounds()?.into();
-                    bounds.translate(pos);
                     bounds.translate((vsize - bounds.size()).scaled(0.5));
                     bounds.translate(translation.scaled(effective_scale));
                     bounds = bounds.scaled(effective_scale);
+                    if i != 0 {
+                        pos.y += (prev_bounds.height() + bounds.height()) / 2.0;
+                    }
+                    bounds.translate(pos);
 
-                    pos.y += bounds.size().y;
                     pos.y += Self::GAP * effective_scale;
+                    prev_bounds = bounds;
 
                     out.push(bounds.into());
                 }

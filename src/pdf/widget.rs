@@ -128,7 +128,7 @@ impl PdfViewer {
             scale: 1.0,
             fractional_scaling: 1.0,
             viewport: RefCell::default(),
-            layout: PageLayout::TwoPage,
+            layout: PageLayout::SinglePage,
             gradient_cache,
             mouse_pos: Vector::zero(),
             mouse_pressed_at: Vector::zero(),
@@ -137,7 +137,6 @@ impl PdfViewer {
     }
 
     pub fn update(&mut self, msg: PdfMessage) -> iced::Task<PdfMessage> {
-        debug!("{:?}", msg);
         let mut out = iced::Task::none();
         let page_count = self.doc.page_count().unwrap() as usize;
         match msg {
