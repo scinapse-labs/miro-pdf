@@ -1,9 +1,9 @@
-use std::{path::PathBuf};
+use std::{cell::RefCell, path::PathBuf};
 
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
 use iced::{
-    Renderer,
+    Renderer, Size,
     widget::{
         self,
         canvas::{self, Cache, Stroke},
@@ -89,6 +89,8 @@ pub struct PdfViewer {
     pub scale: f32,
     fractional_scaling: f32,
 
+    viewport: RefCell<Size<f32>>,
+
     mouse_pos: Vector<f32>,
     mouse_pressed_at: Vector<f32>,
     mouse_interaction: MouseInteraction,
@@ -125,6 +127,7 @@ impl PdfViewer {
             translation: Vector::zero(),
             scale: 1.0,
             fractional_scaling: 1.0,
+            viewport: RefCell::default(),
             layout: PageLayout::TwoPage,
             gradient_cache,
             mouse_pos: Vector::zero(),
@@ -134,12 +137,49 @@ impl PdfViewer {
     }
 
     pub fn update(&mut self, msg: PdfMessage) -> iced::Task<PdfMessage> {
+        debug!("{:?}", msg);
         let mut out = iced::Task::none();
-        //debug!("PdfViewer::update({msg:?})");
+        let page_count = self.doc.page_count().unwrap() as usize;
         match msg {
-            PdfMessage::PageDown => {}
-            PdfMessage::PageUp => {}
-            PdfMessage::SetPage(_) => {}
+            PdfMessage::PageDown => {
+                // TODO: Methods for getting page above and below the current page set
+                self.translation.y += self
+                    .layout
+                    .page_set_height(
+                        &self.doc,
+                        self.translation,
+                        self.scale,
+                        self.fractional_scaling,
+                        self.viewport.borrow().clone(),
+                    )
+                    .unwrap();
+            }
+            PdfMessage::PageUp => {
+                // TODO: Methods for getting page above and below the current page set
+                self.translation.y -= self
+                    .layout
+                    .page_set_height(
+                        &self.doc,
+                        self.translation,
+                        self.scale,
+                        self.fractional_scaling,
+                        self.viewport.borrow().clone(),
+                    )
+                    .unwrap();
+            }
+            PdfMessage::SetPage(idx) => {
+                if idx < page_count && idx > 0 && page_count > 0 {
+                    if let Ok(translation) = self.layout.translation_for_page(
+                        &self.doc,
+                        self.scale,
+                        self.fractional_scaling,
+                        idx,
+                        self.viewport.borrow().clone(),
+                    ) {
+                        self.translation = translation;
+                    }
+                }
+            }
             PdfMessage::SetTranslation(vector) => {
                 self.translation = vector;
             }
@@ -191,7 +231,7 @@ impl PdfViewer {
                             out = iced::Task::done(PdfMessage::PageDown);
                         }
                         MouseAction::PreviousPage => {
-                            out = iced::Task::done(PdfMessage::PageDown);
+                            out = iced::Task::done(PdfMessage::PageUp);
                         }
                         MouseAction::ZoomIn => {
                             out = iced::Task::done(PdfMessage::ZoomIn);
@@ -234,6 +274,10 @@ impl PdfViewer {
 
     pub fn view(&self) -> iced::Element<'_, PdfMessage> {
         widget::responsive(|size| {
+            {
+                let mut viewport = self.viewport.borrow_mut();
+                *viewport = size;
+            }
             let rects = self
                 .layout
                 .pages_rects(

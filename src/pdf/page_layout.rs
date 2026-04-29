@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use iced::Size;
-use mupdf::{Document, Page};
+use mupdf::{Document, Page, page};
 use num::Integer;
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
@@ -93,9 +93,34 @@ impl PageLayout {
         scale: f32,
         fractional_scale: f32,
         page_idx: usize,
-        viewport: Rect<f32>,
-    ) -> Vector<f32> {
-        todo!("")
+        viewport: Size<f32>,
+    ) -> Result<Vector<f32>> {
+        let rects = self.pages_rects(doc, Vector::zero(), scale, fractional_scale, viewport)?;
+        rects
+            .get(page_idx)
+            .map(|rect| rect.center())
+            .ok_or(anyhow!("Page index {page_idx} out of bounds"))
+    }
+
+    pub fn current_page_index(
+        &self,
+        doc: &Document,
+        translation: Vector<f32>,
+        scale: f32,
+        fractional_scale: f32,
+        viewport: Size<f32>,
+    ) -> Result<usize> {
+        let rects = self.pages_rects(doc, translation, scale, fractional_scale, viewport)?;
+        let mut closest = 0;
+        if rects.is_empty() {
+            return Err(anyhow!("There are no pages"));
+        }
+        for (i, rect) in rects.iter().enumerate() {
+            if rect.center().norm_squared() < rects[closest].center().norm_squared() {
+                closest = i;
+            }
+        }
+        return Ok(closest);
     }
 
     /// Returns the height of the row of pages occupying the middle of the creen
@@ -105,8 +130,33 @@ impl PageLayout {
         translation: Vector<f32>,
         scale: f32,
         fractional_scale: f32,
-        viewport: Rect<f32>,
-    ) -> f32 {
-        todo!("")
+        viewport: Size<f32>,
+    ) -> Result<f32> {
+        let rects = self.pages_rects(doc, translation, scale, fractional_scale, viewport)?;
+        match self {
+            PageLayout::SinglePage => Ok(rects
+                [self.current_page_index(doc, translation, scale, fractional_scale, viewport)?]
+            .height()),
+            PageLayout::TwoPage => {
+                let idx = (self.current_page_index(
+                    doc,
+                    translation,
+                    scale,
+                    fractional_scale,
+                    viewport,
+                )? % 2
+                    * 2)
+                .min(doc.page_count()? as usize);
+
+                let heights = vec![
+                    rects.get(idx).map(|rect| rect.height()),
+                    rects.get(idx + 1).map(|rect| rect.height()),
+                ];
+
+                Ok(heights.into_iter().flatten().fold(0.0, |a, b| a.max(b)))
+            }
+            PageLayout::TwoPageTitlePage => todo!(),
+            PageLayout::Presentation => todo!(),
+        }
     }
 }
