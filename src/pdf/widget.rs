@@ -61,7 +61,17 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                     rect.size().into(),
                     Stroke::default().with_color(*color).with_width(1.0),
                 );
+                frame.fill_rectangle(
+                    (rect.center() - Vector::new(2.0, 2.0)).into(),
+                    iced::Size::new(4.0, 4.0),
+                    iced::Color::from_rgb(0.0, 1.0, 0.0),
+                );
             }
+            frame.fill_rectangle(
+                bounds.center() - iced::Vector::new(2.0, 2.0),
+                iced::Size::new(4.0, 4.0),
+                iced::Color::from_rgb(1.0, 0.0, 0.0),
+            );
         });
         vec![bg]
     }
