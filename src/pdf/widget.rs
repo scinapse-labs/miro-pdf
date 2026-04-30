@@ -209,28 +209,36 @@ impl PdfViewer {
         let page_count = self.doc.page_count().unwrap() as usize;
         match msg {
             PdfMessage::PageDown => {
-                self.translation.y = self
+                let current = self
+                    .layout
+                    .center_of_page(&self.doc, self.translation, self.viewport.borrow().clone())
+                    .unwrap();
+                let next = self
                     .layout
                     .center_of_page_below(
                         &self.doc,
                         self.translation,
                         self.viewport.borrow().clone(),
                     )
-                    .unwrap()
-                    .center()
-                    .y;
+                    .unwrap();
+
+                self.translation.y += next.center().y - current.center().y;
             }
             PdfMessage::PageUp => {
-                self.translation.y = self
+                let current = self
+                    .layout
+                    .center_of_page(&self.doc, self.translation, self.viewport.borrow().clone())
+                    .unwrap();
+                let prev = self
                     .layout
                     .center_of_page_above(
                         &self.doc,
                         self.translation,
                         self.viewport.borrow().clone(),
                     )
-                    .unwrap()
-                    .center()
-                    .y;
+                    .unwrap();
+
+                self.translation.y += prev.center().y - current.center().y;
             }
             PdfMessage::SetPage(idx) => {
                 if idx < page_count && idx > 0 && page_count > 0 {

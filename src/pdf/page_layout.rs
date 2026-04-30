@@ -4,6 +4,7 @@ use mupdf::{Document, Page, page};
 use num::Integer;
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
+use tracing::debug;
 
 use crate::geometry::{Rect, Vector};
 
@@ -107,21 +108,33 @@ impl PageLayout {
         &self,
         doc: &Document,
         translation: Vector<f32>,
-        scale: f32,
-        fractional_scale: f32,
         viewport: Size<f32>,
     ) -> Result<usize> {
-        let rects = self.pages_rects(doc, translation, scale, fractional_scale, viewport)?;
+        let rects = self.pages_rects(doc, -translation, 1.0, 1.0, viewport)?;
         let mut closest = 0;
+        let viewport: Vector<_> = viewport.into();
         if rects.is_empty() {
             return Err(anyhow!("There are no pages"));
         }
         for (i, rect) in rects.iter().enumerate() {
-            if rect.center().norm_squared() < rects[closest].center().norm_squared() {
+            if (rect.center() - viewport.scaled(0.5)).norm_squared()
+                < (rects[closest].center() - viewport.scaled(0.5)).norm_squared()
+            {
                 closest = i;
             }
         }
         return Ok(closest);
+    }
+
+    pub fn center_of_page(
+        &self,
+        doc: &Document,
+        translation: Vector<f32>,
+        viewport: Size<f32>,
+    ) -> Result<Rect<f32>> {
+        let rects = self.pages_rects(doc, translation, 1.0, 1.0, viewport)?;
+        let mut idx = self.current_page_index(doc, translation, viewport)?;
+        Ok(rects[idx])
     }
 
     pub fn center_of_page_above(
@@ -130,15 +143,15 @@ impl PageLayout {
         translation: Vector<f32>,
         viewport: Size<f32>,
     ) -> Result<Rect<f32>> {
-        let rects = self.pages_rects(doc, Vector::zero(), 1.0, 1.0, viewport)?;
-        let mut idx = self.current_page_index(doc, translation, 1.0, 1.0, viewport)?;
+        let rects = self.pages_rects(doc, translation, 1.0, 1.0, viewport)?;
+        let mut idx = self.current_page_index(doc, translation, viewport)?;
         idx = (match self {
             PageLayout::SinglePage => idx.saturating_sub(1),
             PageLayout::TwoPage => idx.saturating_sub(2),
             PageLayout::TwoPageTitlePage => todo!(),
             PageLayout::Presentation => todo!(),
         })
-        .clamp(0, rects.len());
+        .clamp(0, rects.len() - 1);
         Ok(rects[idx])
     }
 
@@ -148,15 +161,15 @@ impl PageLayout {
         translation: Vector<f32>,
         viewport: Size<f32>,
     ) -> Result<Rect<f32>> {
-        let rects = self.pages_rects(doc, Vector::zero(), 1.0, 1.0, viewport)?;
-        let mut idx = self.current_page_index(doc, translation, 1.0, 1.0, viewport)?;
+        let rects = self.pages_rects(doc, translation, 1.0, 1.0, viewport)?;
+        let mut idx = self.current_page_index(doc, translation, viewport)?;
         idx = (match self {
             PageLayout::SinglePage => idx + 1,
             PageLayout::TwoPage => idx + 2,
             PageLayout::TwoPageTitlePage => todo!(),
             PageLayout::Presentation => todo!(),
         })
-        .clamp(0, rects.len());
+        .clamp(0, rects.len() - 1);
         Ok(rects[idx])
     }
 }
