@@ -3,7 +3,9 @@ use std::{cell::RefCell, path::PathBuf};
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
 use iced::{
-    Renderer, Size,
+    Renderer, Size, Transformation,
+    advanced::{Renderer as _, graphics::geometry},
+    alignment::Horizontal,
     widget::{
         self,
         canvas::{self, Cache, Stroke},
@@ -66,9 +68,65 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                     iced::Size::new(4.0, 4.0),
                     iced::Color::from_rgb(0.0, 1.0, 0.0),
                 );
+                frame.fill_text(geometry::Text {
+                    content: format!("({}, {})", rect.x0.x, rect.x0.y),
+                    position: rect.x0.into(),
+                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
+                    size: 12.0.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Left,
+                    vertical_alignment: iced::alignment::Vertical::Top,
+                    shaping: widget::text::Shaping::Basic,
+                });
+                frame.fill_text(geometry::Text {
+                    content: format!("({}, {})", rect.x1.x, rect.x0.y),
+                    position: Vector::new(rect.x1.x, rect.x0.y).into(),
+                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
+                    size: 12.0.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Right,
+                    vertical_alignment: iced::alignment::Vertical::Top,
+                    shaping: widget::text::Shaping::Basic,
+                });
+                frame.fill_text(geometry::Text {
+                    content: format!("({}, {})", rect.x0.x, rect.x1.y),
+                    position: Vector::new(rect.x0.x, rect.x1.y).into(),
+                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
+                    size: 12.0.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Left,
+                    vertical_alignment: iced::alignment::Vertical::Bottom,
+                    shaping: widget::text::Shaping::Basic,
+                });
+                frame.fill_text(geometry::Text {
+                    content: format!("({}, {})", rect.x1.x, rect.x1.y),
+                    position: rect.x1.into(),
+                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
+                    size: 12.0.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Right,
+                    vertical_alignment: iced::alignment::Vertical::Bottom,
+                    shaping: widget::text::Shaping::Basic,
+                });
+                frame.fill_text(geometry::Text {
+                    content: format!("({}, {})", rect.center().x, rect.center().y),
+                    position: rect.center().into(),
+                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
+                    size: 12.0.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Left,
+                    vertical_alignment: iced::alignment::Vertical::Top,
+                    shaping: widget::text::Shaping::Basic,
+                });
             }
+            let bounds_size = Vector::new(bounds.size().width, bounds.size().height).scaled(0.5);
             frame.fill_rectangle(
-                bounds.center() - iced::Vector::new(2.0, 2.0),
+                (bounds_size - Vector::new(2.0, 2.0)).into(),
                 iced::Size::new(4.0, 4.0),
                 iced::Color::from_rgb(1.0, 0.0, 0.0),
             );
@@ -151,30 +209,28 @@ impl PdfViewer {
         let page_count = self.doc.page_count().unwrap() as usize;
         match msg {
             PdfMessage::PageDown => {
-                // TODO: Methods for getting page above and below the current page set
-                self.translation.y += self
+                self.translation.y = self
                     .layout
-                    .page_set_height(
+                    .center_of_page_below(
                         &self.doc,
                         self.translation,
-                        self.scale,
-                        self.fractional_scaling,
                         self.viewport.borrow().clone(),
                     )
-                    .unwrap();
+                    .unwrap()
+                    .center()
+                    .y;
             }
             PdfMessage::PageUp => {
-                // TODO: Methods for getting page above and below the current page set
-                self.translation.y -= self
+                self.translation.y = self
                     .layout
-                    .page_set_height(
+                    .center_of_page_above(
                         &self.doc,
                         self.translation,
-                        self.scale,
-                        self.fractional_scaling,
                         self.viewport.borrow().clone(),
                     )
-                    .unwrap();
+                    .unwrap()
+                    .center()
+                    .y;
             }
             PdfMessage::SetPage(idx) => {
                 if idx < page_count && idx > 0 && page_count > 0 {
@@ -208,7 +264,9 @@ impl PdfViewer {
             PdfMessage::ZoomHome => {
                 self.scale = 1.0;
             }
-            PdfMessage::ZoomFit => {}
+            PdfMessage::ZoomFit => {
+                self.translation = Vector::zero();
+            }
             PdfMessage::Move(vector) => {
                 self.translation += vector;
             }

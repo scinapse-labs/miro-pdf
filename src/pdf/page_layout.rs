@@ -124,40 +124,39 @@ impl PageLayout {
         return Ok(closest);
     }
 
-    /// Returns the height of the row of pages occupying the middle of the creen
-    pub fn page_set_height(
+    pub fn center_of_page_above(
         &self,
         doc: &Document,
         translation: Vector<f32>,
-        scale: f32,
-        fractional_scale: f32,
         viewport: Size<f32>,
-    ) -> Result<f32> {
-        let rects = self.pages_rects(doc, translation, scale, fractional_scale, viewport)?;
-        match self {
-            PageLayout::SinglePage => Ok(rects
-                [self.current_page_index(doc, translation, scale, fractional_scale, viewport)?]
-            .height()),
-            PageLayout::TwoPage => {
-                let idx = (self.current_page_index(
-                    doc,
-                    translation,
-                    scale,
-                    fractional_scale,
-                    viewport,
-                )? % 2
-                    * 2)
-                .min(doc.page_count()? as usize);
-
-                let heights = vec![
-                    rects.get(idx).map(|rect| rect.height()),
-                    rects.get(idx + 1).map(|rect| rect.height()),
-                ];
-
-                Ok(heights.into_iter().flatten().fold(0.0, |a, b| a.max(b)))
-            }
+    ) -> Result<Rect<f32>> {
+        let rects = self.pages_rects(doc, Vector::zero(), 1.0, 1.0, viewport)?;
+        let mut idx = self.current_page_index(doc, translation, 1.0, 1.0, viewport)?;
+        idx = (match self {
+            PageLayout::SinglePage => idx.saturating_sub(1),
+            PageLayout::TwoPage => idx.saturating_sub(2),
             PageLayout::TwoPageTitlePage => todo!(),
             PageLayout::Presentation => todo!(),
-        }
+        })
+        .clamp(0, rects.len());
+        Ok(rects[idx])
+    }
+
+    pub fn center_of_page_below(
+        &self,
+        doc: &Document,
+        translation: Vector<f32>,
+        viewport: Size<f32>,
+    ) -> Result<Rect<f32>> {
+        let rects = self.pages_rects(doc, Vector::zero(), 1.0, 1.0, viewport)?;
+        let mut idx = self.current_page_index(doc, translation, 1.0, 1.0, viewport)?;
+        idx = (match self {
+            PageLayout::SinglePage => idx + 1,
+            PageLayout::TwoPage => idx + 2,
+            PageLayout::TwoPageTitlePage => todo!(),
+            PageLayout::Presentation => todo!(),
+        })
+        .clamp(0, rects.len());
+        Ok(rects[idx])
     }
 }
