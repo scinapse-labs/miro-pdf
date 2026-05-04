@@ -556,7 +556,7 @@ impl App {
     }
 
     fn create_menu_bar(&self) -> Element<'_, AppMessage> {
-        let menu_tpl_1 = |items| Menu::new(items).max_width(205.0).offset(0.0).spacing(0.0);
+        let menu_tpl_1 = |items| Menu::new(items).max_width(300.0).offset(0.0).spacing(0.0);
         let cfg = CONFIG.read().unwrap();
 
         let exit_close_label = if self.pdfs.is_empty() {
@@ -735,19 +735,19 @@ impl App {
                 menu_tpl_1(menu_items!((menu_button(
                     "Single page",
                     AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::SinglePage)),
-                    None
+                    cfg.get_binding_for_msg(BindableMessage::SinglePageLayout)
                 ))(menu_button(
                     "Double page",
-                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::TwoPage)),
-                    None
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::DoublePage)),
+                    cfg.get_binding_for_msg(BindableMessage::DoublePageLayout)
                 ))(menu_button(
                     "Double page with title page",
-                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::TwoPageTitlePage)),
-                    None
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::DoublePageTitlePage)),
+                    cfg.get_binding_for_msg(BindableMessage::DoublePageTitlePageLayout)
                 ))(menu_button(
                     "Presentation",
                     AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::Presentation)),
-                    None
+                    cfg.get_binding_for_msg(BindableMessage::PresentationLayout)
                 ))))
             ))
             .draw_path(menu::DrawPath::Backdrop)

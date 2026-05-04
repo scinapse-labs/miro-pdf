@@ -5,7 +5,11 @@ use colored::Colorize;
 use keybinds::{KeyInput, KeySeq, Keybind, Keybinds};
 use strum::EnumString;
 
-use crate::{app::AppMessage, geometry::Vector, pdf::PdfMessage};
+use crate::{
+    app::AppMessage,
+    geometry::Vector,
+    pdf::{PdfMessage, page_layout::PageLayout},
+};
 
 pub const MOVE_STEP: f32 = 40.0;
 
@@ -180,6 +184,10 @@ pub enum BindableMessage {
     JumpForward,
     ToggleFullscreen,
     TogglePresentationMode,
+    SinglePageLayout,
+    DoublePageLayout,
+    DoublePageTitlePageLayout,
+    PresentationLayout,
 }
 
 impl From<BindableMessage> for AppMessage {
@@ -220,6 +228,18 @@ impl From<BindableMessage> for AppMessage {
             BindableMessage::JumpForward => AppMessage::JumpForward,
             BindableMessage::ToggleFullscreen => AppMessage::ToggleFullscreen,
             BindableMessage::TogglePresentationMode => AppMessage::TogglePresentationMode,
+            BindableMessage::SinglePageLayout => {
+                AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::SinglePage))
+            }
+            BindableMessage::DoublePageLayout => {
+                AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::DoublePage))
+            }
+            BindableMessage::DoublePageTitlePageLayout => {
+                AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::DoublePageTitlePage))
+            }
+            BindableMessage::PresentationLayout => {
+                AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::Presentation))
+            }
         }
     }
 }
@@ -551,6 +571,22 @@ impl Default for Config {
                 Keybind::new(
                     KeyInput::from_str("F10").unwrap(),
                     BindableMessage::TogglePresentationMode,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("F1").unwrap(),
+                    BindableMessage::SinglePageLayout,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("F2").unwrap(),
+                    BindableMessage::DoublePageLayout,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("F3").unwrap(),
+                    BindableMessage::DoublePageTitlePageLayout,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("F4").unwrap(),
+                    BindableMessage::PresentationLayout,
                 ),
                 Keybind::new(
                     KeyInput::from_str("Ctrl+o").unwrap(),

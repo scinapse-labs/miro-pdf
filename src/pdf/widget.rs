@@ -196,7 +196,7 @@ impl PdfViewer {
             scale: 1.0,
             fractional_scaling: 1.0,
             viewport: RefCell::default(),
-            layout: PageLayout::TwoPageTitlePage,
+            layout: PageLayout::SinglePage,
             gradient_cache,
             mouse_pos: Vector::zero(),
             mouse_pressed_at: Vector::zero(),

@@ -13,9 +13,9 @@ pub enum PageLayout {
     /// One page per row, many rows
     SinglePage,
     /// Two pages per row, many rows
-    TwoPage,
+    DoublePage,
     /// Two pages per row, many rows, except for the first page which is on its own
-    TwoPageTitlePage,
+    DoublePageTitlePage,
     /// Only one page on the screen at a time
     Presentation,
 }
@@ -59,7 +59,7 @@ impl PageLayout {
                     out.push(bounds.into());
                 }
             }
-            PageLayout::TwoPage => {
+            PageLayout::DoublePage => {
                 let mut pos: Vector<f32> = Vector::zero();
                 for (i, page) in pages.flatten().enumerate() {
                     let mut bounds: Rect<f32> = page.bounds()?.into();
@@ -88,7 +88,7 @@ impl PageLayout {
                     }
                 }
             }
-            PageLayout::TwoPageTitlePage => {
+            PageLayout::DoublePageTitlePage => {
                 let mut pos: Vector<f32> = Vector::zero();
                 let Some(Ok(first_page)) = pages.next() else {
                     return Ok(out);
@@ -235,8 +235,8 @@ impl PageLayout {
         let mut idx = self.current_page_index(doc, translation, viewport)?;
         idx = (match self {
             PageLayout::SinglePage => idx.saturating_sub(1),
-            PageLayout::TwoPage => idx.saturating_sub(2),
-            PageLayout::TwoPageTitlePage => idx.saturating_sub(2),
+            PageLayout::DoublePage => idx.saturating_sub(2),
+            PageLayout::DoublePageTitlePage => idx.saturating_sub(2),
             PageLayout::Presentation => idx.saturating_sub(1),
         })
         .clamp(0, rects.len() - 1);
@@ -253,8 +253,8 @@ impl PageLayout {
         let mut idx = self.current_page_index(doc, translation, viewport)?;
         idx = (match self {
             PageLayout::SinglePage => idx + 1,
-            PageLayout::TwoPage => idx + 2,
-            PageLayout::TwoPageTitlePage => {
+            PageLayout::DoublePage => idx + 2,
+            PageLayout::DoublePageTitlePage => {
                 if idx == 0 {
                     idx + 1
                 } else {
