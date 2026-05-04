@@ -744,6 +744,10 @@ impl App {
                     "Double page with title page",
                     AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::TwoPageTitlePage)),
                     None
+                ))(menu_button(
+                    "Presentation",
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::Presentation)),
+                    None
                 ))))
             ))
             .draw_path(menu::DrawPath::Backdrop)

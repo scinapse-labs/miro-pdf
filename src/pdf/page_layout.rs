@@ -124,7 +124,45 @@ impl PageLayout {
                     out[1].translate(Vector::new(half_width, 0.0));
                 }
             }
-            PageLayout::Presentation => todo!(),
+            PageLayout::Presentation => {
+                let mut pos: Vector<f32> = Vector::zero();
+                let mut prev_bounds = Rect::default();
+                for (i, page) in pages.flatten().enumerate() {
+                    let mut bounds: Rect<f32> = page.bounds()?.into();
+                    bounds.translate((vsize - bounds.size()).scaled(0.5));
+                    bounds.translate(translation.scaled(effective_scale));
+                    bounds = bounds.scaled(effective_scale);
+                    if i != 0 {
+                        pos.y += (prev_bounds.height() + bounds.height()) / 2.0;
+                    }
+                    bounds.translate(pos);
+
+                    pos.y += Self::GAP * effective_scale;
+                    prev_bounds = bounds;
+
+                    out.push(bounds.into());
+                }
+
+                if !out.is_empty() {
+                    let viewport_center: Vector<f32> = vsize.scaled(0.5).into();
+                    let closest = out
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            (a.center() - viewport_center)
+                                .norm_squared()
+                                .partial_cmp(&(b.center() - viewport_center).norm_squared())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap();
+
+                    let snap_offset = viewport_center - out[closest].center();
+                    for rect in &mut out {
+                        rect.translate(snap_offset);
+                    }
+                }
+            }
         }
         Ok(out)
     }
