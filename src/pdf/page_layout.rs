@@ -35,7 +35,7 @@ impl PageLayout {
         fractional_scale: f32,
         viewport: Size<f32>,
     ) -> Result<Vec<Rect<f32>>> {
-        let mut out = vec![];
+        let mut out: Vec<Rect<f32>> = vec![];
         let mut pages = doc.pages()?;
         let vsize: Vector<_> = viewport.into();
         let effective_scale = scale * fractional_scale;
@@ -78,6 +78,14 @@ impl PageLayout {
                     }
 
                     out.push(bounds.into());
+                }
+
+                if out.len() >= 2 {
+                    let total_row_width =
+                        out[0].width() + out[1].width() + Self::GAP * effective_scale * 2.0;
+                    for bound in &mut out {
+                        bound.translate(Vector::new(-total_row_width / 4.0, 0.0));
+                    }
                 }
             }
             PageLayout::TwoPageTitlePage => {
@@ -213,7 +221,7 @@ impl PageLayout {
         viewport: Size<f32>,
     ) -> Result<Rect<f32>> {
         let rects = self.pages_rects(doc, translation, 1.0, 1.0, viewport)?;
-        let mut idx = self.current_page_index(doc, translation, viewport)?;
+        let idx = self.current_page_index(doc, translation, viewport)?;
         Ok(rects[idx])
     }
 
