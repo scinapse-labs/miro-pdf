@@ -4,7 +4,6 @@ use mupdf::{Document, Page, page};
 use num::Integer;
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
-use tracing::debug;
 
 use crate::geometry::{Rect, Vector};
 
@@ -37,7 +36,7 @@ impl PageLayout {
         viewport: Size<f32>,
     ) -> Result<Vec<Rect<f32>>> {
         let mut out = vec![];
-        let pages = doc.pages()?;
+        let mut pages = doc.pages()?;
         let vsize: Vector<_> = viewport.into();
         let effective_scale = scale * fractional_scale;
         match self {
@@ -81,7 +80,50 @@ impl PageLayout {
                     out.push(bounds.into());
                 }
             }
-            PageLayout::TwoPageTitlePage => todo!(),
+            PageLayout::TwoPageTitlePage => {
+                let mut pos: Vector<f32> = Vector::zero();
+                let Some(Ok(first_page)) = pages.next() else {
+                    return Ok(out);
+                };
+                let mut bounds: Rect<f32> = first_page.bounds()?.into();
+                bounds.translate((vsize - bounds.size()).scaled(0.5));
+                bounds.translate(translation.scaled(effective_scale));
+                bounds = bounds.scaled(effective_scale);
+                out.push(bounds.into());
+                pos.y += Self::GAP * effective_scale + bounds.size().y;
+
+                for (i, page) in pages.flatten().enumerate() {
+                    let mut bounds: Rect<f32> = page.bounds()?.into();
+                    bounds.translate(pos);
+                    bounds.translate((vsize - bounds.size()).scaled(0.5));
+                    bounds.translate(translation.scaled(effective_scale));
+                    bounds = bounds.scaled(effective_scale);
+
+                    if i.is_odd() {
+                        pos.y += bounds.size().y;
+                        pos.y += Self::GAP * effective_scale;
+                        pos.x = 0.0;
+                    } else {
+                        pos.x += bounds.size().x;
+                        pos.x += Self::GAP * effective_scale;
+                    }
+
+                    out.push(bounds.into());
+                }
+
+                if out.len() >= 3 {
+                    let pages_below_width =
+                        out[1].width() + out[2].width() + Self::GAP * effective_scale * 2.0;
+                    out[0].translate(Vector::new(pages_below_width / 4.0, 0.0));
+
+                    for bound in &mut out {
+                        bound.translate(Vector::new(-pages_below_width / 4.0, 0.0));
+                    }
+                } else if out.len() == 2 {
+                    let half_width = first_page.bounds()?.width() / 2.0;
+                    out[1].translate(Vector::new(half_width, 0.0));
+                }
+            }
             PageLayout::Presentation => todo!(),
         }
         Ok(out)
@@ -148,8 +190,8 @@ impl PageLayout {
         idx = (match self {
             PageLayout::SinglePage => idx.saturating_sub(1),
             PageLayout::TwoPage => idx.saturating_sub(2),
-            PageLayout::TwoPageTitlePage => todo!(),
-            PageLayout::Presentation => todo!(),
+            PageLayout::TwoPageTitlePage => idx.saturating_sub(2),
+            PageLayout::Presentation => idx.saturating_sub(1),
         })
         .clamp(0, rects.len() - 1);
         Ok(rects[idx])
@@ -166,8 +208,14 @@ impl PageLayout {
         idx = (match self {
             PageLayout::SinglePage => idx + 1,
             PageLayout::TwoPage => idx + 2,
-            PageLayout::TwoPageTitlePage => todo!(),
-            PageLayout::Presentation => todo!(),
+            PageLayout::TwoPageTitlePage => {
+                if idx == 0 {
+                    idx + 1
+                } else {
+                    idx + 2
+                }
+            }
+            PageLayout::Presentation => idx + 1,
         })
         .clamp(0, rects.len() - 1);
         Ok(rects[idx])
