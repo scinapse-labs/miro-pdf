@@ -23,9 +23,7 @@ use crate::{
 const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
-// NOTE: The primitive might not end up being a page here but rather the entire document. Regardless
-// using a canvas allows us to sidestep creating a custom widget entirely. This should be the
-// simpler approach.
+// A texture is drawn via a handle. Most likely we'll want to use the Handle::from_grba constructor to create the textures for each visible page.
 #[derive(Debug)]
 struct Document {
     cache: Cache,
@@ -363,8 +361,12 @@ impl PdfViewer {
                     size,
                 )
                 .unwrap();
+            let viewport_rect =
+                Rect::from_pos_size(Vector::zero(), Vector::new(size.width, size.height));
+
             let with_colors: Vec<_> = rects
                 .into_iter()
+                .filter(|r| viewport_rect.intersects(r))
                 .map(|r| (iced::Color::from_rgba(1.0, 1.0, 1.0, 1.0), r))
                 .collect();
             widget::canvas(Document::new(with_colors))

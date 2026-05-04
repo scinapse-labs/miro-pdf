@@ -247,6 +247,13 @@ where
     pub fn contains(&self, v: Vector<T>) -> bool {
         self.x0.x < v.x && self.x1.x > v.x && self.x0.y < v.y && self.x1.y > v.y
     }
+
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.x0.x < other.x1.x
+            && self.x1.x > other.x0.x
+            && self.x0.y < other.x1.y
+            && self.x1.y > other.x0.y
+    }
 }
 
 impl From<Rect<f32>> for mupdf::Rect {
