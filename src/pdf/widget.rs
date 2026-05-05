@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
@@ -35,15 +35,35 @@ const MIN_CLICK_DISTANCE: f32 = 5.0;
 // I am however sceptical that a simple &[u8] would be enough to meet the type constraint. Maybe I can
 // wrap my Pixmaps in Arcs which should make them send and perform some magic to extract the bytes and
 // give them to Bytes.
+/// Wraps an `Arc<Pixmap>` so it can be used with `image::Bytes::from_owner`.
+///
+/// `mupdf::Pixmap` is `Send` because it owns its own pixel buffer and is only
+/// accessed immutably here, so an `Arc` around it satisfies the `Send + 'static`
+/// bounds required by `iced::advanced::image::Bytes`.
+#[derive(Debug)]
+struct PixmapBytes(Arc<Pixmap>);
+
+// Safety: `Pixmap` owns its pixel buffer and we only access it immutably
+// (`samples()`). The underlying `*mut fz_pixmap` is never mutated after
+// the pixmap has been rendered, so it is safe to send the owned buffer
+// to another thread (e.g. the GPU upload thread used by iced).
+unsafe impl Send for PixmapBytes {}
+unsafe impl Sync for PixmapBytes {}
+
+impl AsRef<[u8]> for PixmapBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.samples()
+    }
+}
+
 #[derive(Debug)]
 struct Document {
     cache: Cache,
-    // TODO: This should be a texture rather than a color
-    pages: Vec<(Rc<Pixmap>, Rect<f32>)>,
+    pages: Vec<(Arc<Pixmap>, Rect<f32>)>,
 }
 
 impl Document {
-    pub fn new(pages: Vec<(Rc<Pixmap>, Rect<f32>)>) -> Self {
+    pub fn new(pages: Vec<(Arc<Pixmap>, Rect<f32>)>) -> Self {
         Self {
             cache: Cache::default(),
             pages,
@@ -136,7 +156,7 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                 let handle = image::Handle::from_rgba(
                     pix.width(),
                     pix.height(),
-                    image::Bytes::copy_from_slice(pix.samples()),
+                    image::Bytes::from_owner(PixmapBytes(Arc::clone(pix))),
                 );
                 let bounds: iced::Rectangle = (*rect).into();
                 frame.draw_image(bounds, &handle);
@@ -173,7 +193,7 @@ pub struct PdfViewer {
 
     doc: mupdf::Document,
     display_lists: Vec<mupdf::DisplayList>,
-    pixmaps: RefCell<HashMap<PixmapKey, Rc<mupdf::Pixmap>>>,
+    pixmaps: RefCell<HashMap<PixmapKey, Arc<mupdf::Pixmap>>>,
 
     pub translation: Vector<f32>,
     pub scale: f32,
@@ -423,9 +443,9 @@ impl PdfViewer {
                         self.display_lists[i]
                             .run(&device, &Matrix::IDENTITY, bounds)
                             .unwrap();
-                        cache.insert(key, Rc::new(pix));
+                        cache.insert(key, Arc::new(pix));
                     }
-                    let pix = Rc::clone(cache.get(&key).unwrap());
+                    let pix = Arc::clone(cache.get(&key).unwrap());
                     (pix, r)
                 })
                 .collect();
