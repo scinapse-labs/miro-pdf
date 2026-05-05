@@ -24,19 +24,6 @@ use crate::{
 const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
-// A texture is drawn via a handle. Most likely we'll want to use the Handle::from_rgba constructor to
-// create the textures for each visible page. I want to achieve zero-copy construction of the handle
-// where the owner of the bytes are the original Pixmap objects from mupdf.
-//
-// The data passed to from_rgba needs to adhere to `impl Into<iced::advanced:image::Bytes>`.
-// mupdf::Pixmap::samples() -> &[u8] might be enough. Otherwise I can make use of
-// Bytes::from_owner<T>(owner: T) where T: AsRef<[u8]> + Send + 'static.
-//
-// I am however sceptical that a simple &[u8] would be enough to meet the type constraint. Maybe I can
-// wrap my Pixmaps in Arcs which should make them send and perform some magic to extract the bytes and
-// give them to Bytes.
-/// Wraps an `Arc<Pixmap>` so it can be used with `image::Bytes::from_owner`.
-///
 /// `mupdf::Pixmap` is `Send` because it owns its own pixel buffer and is only
 /// accessed immutably here, so an `Arc` around it satisfies the `Send + 'static`
 /// bounds required by `iced::advanced::image::Bytes`.
@@ -56,14 +43,22 @@ impl AsRef<[u8]> for PixmapBytes {
     }
 }
 
-#[derive(Debug)]
 struct Document {
     cache: Cache,
-    pages: Vec<(Arc<Pixmap>, Rect<f32>)>,
+    pages: Vec<(image::Handle, Rect<f32>)>,
+}
+
+impl std::fmt::Debug for Document {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Document")
+            .field("cache", &self.cache)
+            .field("page_count", &self.pages.len())
+            .finish()
+    }
 }
 
 impl Document {
-    pub fn new(pages: Vec<(Arc<Pixmap>, Rect<f32>)>) -> Self {
+    pub fn new(pages: Vec<(image::Handle, Rect<f32>)>) -> Self {
         Self {
             cache: Cache::default(),
             pages,
@@ -83,7 +78,7 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
         cursor: iced::advanced::mouse::Cursor,
     ) -> Vec<canvas::Geometry<Renderer>> {
         let bg = self.cache.draw(renderer, bounds.size(), |frame| {
-            for (pix, rect) in &self.pages {
+            for (handle, rect) in &self.pages {
                 let mut c = iced::Color::WHITE;
                 c.a = 0.2;
                 frame.fill_rectangle((rect.x0).into(), rect.size().into(), c);
@@ -153,13 +148,8 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                     shaping: widget::text::Shaping::Basic,
                 });
 
-                let handle = image::Handle::from_rgba(
-                    pix.width(),
-                    pix.height(),
-                    image::Bytes::from_owner(PixmapBytes(Arc::clone(pix))),
-                );
                 let bounds: iced::Rectangle = (*rect).into();
-                frame.draw_image(bounds, &handle);
+                frame.draw_image(bounds, handle);
             }
             let bounds_size = Vector::new(bounds.size().width, bounds.size().height).scaled(0.5);
             frame.fill_rectangle(
@@ -193,7 +183,7 @@ pub struct PdfViewer {
 
     doc: mupdf::Document,
     display_lists: Vec<mupdf::DisplayList>,
-    pixmaps: RefCell<HashMap<PixmapKey, Arc<mupdf::Pixmap>>>,
+    handles: RefCell<HashMap<PixmapKey, image::Handle>>,
 
     pub translation: Vector<f32>,
     pub scale: f32,
@@ -243,7 +233,7 @@ impl PdfViewer {
             draw_page_borders: true,
             doc,
             display_lists,
-            pixmaps: RefCell::default(),
+            handles: RefCell::default(),
             translation: Vector::zero(),
             scale: 1.0,
             fractional_scaling: 1.0,
@@ -418,17 +408,16 @@ impl PdfViewer {
             let viewport_rect =
                 Rect::from_pos_size(Vector::zero(), Vector::new(size.width, size.height));
 
-            //let mut display_lists = self.display_lists;
-
-            let with_colors: Vec<_> = rects
+            let with_handles: Vec<_> = rects
                 .into_iter()
                 .zip(self.doc.pages().unwrap())
                 .enumerate()
                 .filter(|(_, (r, _page))| viewport_rect.intersects(r))
                 .map(|(i, (r, page))| {
                     let key = (i, (self.scale * self.fractional_scaling).to_bits());
-                    let mut cache = self.pixmaps.borrow_mut();
+                    let mut cache = self.handles.borrow_mut();
                     if !cache.contains_key(&key) {
+                        debug!("Cache miss for page {}", i);
                         let page = page.unwrap();
                         let bounds = page.bounds().unwrap();
                         let mut pix = Pixmap::new_with_w_h(
@@ -443,14 +432,19 @@ impl PdfViewer {
                         self.display_lists[i]
                             .run(&device, &Matrix::IDENTITY, bounds)
                             .unwrap();
-                        cache.insert(key, Arc::new(pix));
+                        let handle = image::Handle::from_rgba(
+                            pix.width(),
+                            pix.height(),
+                            image::Bytes::from_owner(PixmapBytes(Arc::new(pix))),
+                        );
+                        cache.insert(key, handle);
                     }
-                    let pix = Arc::clone(cache.get(&key).unwrap());
-                    (pix, r)
+                    let handle = cache.get(&key).unwrap().clone();
+                    (handle, r)
                 })
                 .collect();
 
-            widget::canvas(Document::new(with_colors))
+            widget::canvas(Document::new(with_handles))
                 .width(iced::Length::Fill)
                 .height(iced::Length::Fill)
                 .into()
