@@ -23,6 +23,7 @@ pub enum PageLayout {
 impl PageLayout {
     const GAP: f32 = 10.0;
 
+    // TODO: This should take a PageIter rather than the entire Document
     /// Returns visible pages and their bounding boxes relative to the widgets origin. A translation
     /// of (0,0) should result in the first page row being centered on the screen. Scale is applied
     /// after translation with respect to the center of the screen. Thus zooming doesn't move the

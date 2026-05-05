@@ -1,16 +1,17 @@
-use std::{cell::RefCell, path::PathBuf};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf};
 
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
 use iced::{
     Renderer, Size, Transformation,
-    advanced::{Renderer as _, graphics::geometry},
+    advanced::{Renderer as _, graphics::geometry, image},
     alignment::Horizontal,
     widget::{
         self,
         canvas::{self, Cache, Stroke},
     },
 };
+use mupdf::{Colorspace, Device, Matrix, Pixmap};
 use tracing::debug;
 
 use crate::{
@@ -23,16 +24,26 @@ use crate::{
 const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
-// A texture is drawn via a handle. Most likely we'll want to use the Handle::from_grba constructor to create the textures for each visible page.
+// A texture is drawn via a handle. Most likely we'll want to use the Handle::from_rgba constructor to
+// create the textures for each visible page. I want to achieve zero-copy construction of the handle
+// where the owner of the bytes are the original Pixmap objects from mupdf.
+//
+// The data passed to from_rgba needs to adhere to `impl Into<iced::advanced:image::Bytes>`.
+// mupdf::Pixmap::samples() -> &[u8] might be enough. Otherwise I can make use of
+// Bytes::from_owner<T>(owner: T) where T: AsRef<[u8]> + Send + 'static.
+//
+// I am however sceptical that a simple &[u8] would be enough to meet the type constraint. Maybe I can
+// wrap my Pixmaps in Arcs which should make them send and perform some magic to extract the bytes and
+// give them to Bytes.
 #[derive(Debug)]
 struct Document {
     cache: Cache,
     // TODO: This should be a texture rather than a color
-    pages: Vec<(iced::Color, Rect<f32>)>,
+    pages: Vec<(Pixmap, Rect<f32>)>,
 }
 
 impl Document {
-    pub fn new(pages: Vec<(iced::Color, Rect<f32>)>) -> Self {
+    pub fn new(pages: Vec<(Pixmap, Rect<f32>)>) -> Self {
         Self {
             cache: Cache::default(),
             pages,
@@ -52,14 +63,14 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
         cursor: iced::advanced::mouse::Cursor,
     ) -> Vec<canvas::Geometry<Renderer>> {
         let bg = self.cache.draw(renderer, bounds.size(), |frame| {
-            for (color, rect) in &self.pages {
-                let mut c = *color;
+            for (pix, rect) in &self.pages {
+                let mut c = iced::Color::WHITE;
                 c.a = 0.2;
                 frame.fill_rectangle((rect.x0).into(), rect.size().into(), c);
                 frame.stroke_rectangle(
                     (rect.x0).into(),
                     rect.size().into(),
-                    Stroke::default().with_color(*color).with_width(1.0),
+                    Stroke::default().with_color(c).with_width(1.0),
                 );
                 frame.fill_rectangle(
                     (rect.center() - Vector::new(2.0, 2.0)).into(),
@@ -121,6 +132,14 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                     vertical_alignment: iced::alignment::Vertical::Top,
                     shaping: widget::text::Shaping::Basic,
                 });
+
+                let handle = image::Handle::from_rgba(
+                    pix.width(),
+                    pix.height(),
+                    image::Bytes::copy_from_slice(pix.samples()),
+                );
+                let bounds: iced::Rectangle = (*rect).into();
+                frame.draw_image(bounds, &handle);
             }
             let bounds_size = Vector::new(bounds.size().width, bounds.size().height).scaled(0.5);
             frame.fill_rectangle(
@@ -140,6 +159,9 @@ pub enum MouseInteraction {
     Selecting,
 }
 
+/// A pixmap is cached by its page number and the zoom level at which it was generated.
+type PixmapKey = (usize, f32);
+
 /// Renders a pdf document. Owns all information related to the document.
 #[derive(Debug)]
 pub struct PdfViewer {
@@ -150,6 +172,8 @@ pub struct PdfViewer {
     pub draw_page_borders: bool,
 
     doc: mupdf::Document,
+    display_lists: Vec<mupdf::DisplayList>,
+    pixmaps: RefCell<HashMap<PixmapKey, mupdf::Pixmap>>,
 
     pub translation: Vector<f32>,
     pub scale: f32,
@@ -174,6 +198,14 @@ impl PdfViewer {
             .to_string_lossy()
             .to_string();
         let doc = mupdf::Document::open(&path.to_str().unwrap())?;
+        let mut display_lists = vec![];
+        for page in doc.pages()?.flatten() {
+            let dl = mupdf::DisplayList::new(page.bounds()?)?;
+            let dummy_device = Device::from_display_list(&dl)?;
+            let ctm = Matrix::IDENTITY;
+            page.run(&dummy_device, &ctm)?;
+            display_lists.push(dl);
+        }
 
         let bg_color = DARK_THEME
             .extended_palette()
@@ -190,6 +222,8 @@ impl PdfViewer {
             invert_colors: false,
             draw_page_borders: true,
             doc,
+            display_lists,
+            pixmaps: RefCell::default(),
             translation: Vector::zero(),
             scale: 1.0,
             fractional_scaling: 1.0,
@@ -364,11 +398,33 @@ impl PdfViewer {
             let viewport_rect =
                 Rect::from_pos_size(Vector::zero(), Vector::new(size.width, size.height));
 
+            //let mut display_lists = self.display_lists;
+
             let with_colors: Vec<_> = rects
                 .into_iter()
-                .filter(|r| viewport_rect.intersects(r))
-                .map(|r| (iced::Color::from_rgba(1.0, 1.0, 1.0, 1.0), r))
+                .zip(self.doc.pages().unwrap())
+                .enumerate()
+                .filter(|(_, (r, page))| viewport_rect.intersects(r))
+                .map(|(i, (r, page))| {
+                    let page = page.unwrap();
+                    let bounds = page.bounds().unwrap();
+                    let mut pix = Pixmap::new_with_w_h(
+                        &Colorspace::device_rgb(),
+                        bounds.width() as i32,
+                        bounds.height() as i32,
+                        true,
+                    )
+                    .unwrap();
+                    pix.samples_mut().fill(255);
+                    let device = Device::from_pixmap(&mut pix).unwrap();
+                    self.display_lists[i]
+                        .run(&device, &Matrix::IDENTITY, bounds)
+                        .unwrap();
+
+                    (pix, r)
+                })
                 .collect();
+
             widget::canvas(Document::new(with_colors))
                 .width(iced::Length::Fill)
                 .height(iced::Length::Fill)
