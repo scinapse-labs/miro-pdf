@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
@@ -39,11 +39,11 @@ const MIN_CLICK_DISTANCE: f32 = 5.0;
 struct Document {
     cache: Cache,
     // TODO: This should be a texture rather than a color
-    pages: Vec<(Pixmap, Rect<f32>)>,
+    pages: Vec<(Rc<Pixmap>, Rect<f32>)>,
 }
 
 impl Document {
-    pub fn new(pages: Vec<(Pixmap, Rect<f32>)>) -> Self {
+    pub fn new(pages: Vec<(Rc<Pixmap>, Rect<f32>)>) -> Self {
         Self {
             cache: Cache::default(),
             pages,
@@ -160,7 +160,7 @@ pub enum MouseInteraction {
 }
 
 /// A pixmap is cached by its page number and the zoom level at which it was generated.
-type PixmapKey = (usize, f32);
+type PixmapKey = (usize, u32);
 
 /// Renders a pdf document. Owns all information related to the document.
 #[derive(Debug)]
@@ -173,7 +173,7 @@ pub struct PdfViewer {
 
     doc: mupdf::Document,
     display_lists: Vec<mupdf::DisplayList>,
-    pixmaps: RefCell<HashMap<PixmapKey, mupdf::Pixmap>>,
+    pixmaps: RefCell<HashMap<PixmapKey, Rc<mupdf::Pixmap>>>,
 
     pub translation: Vector<f32>,
     pub scale: f32,
@@ -404,23 +404,28 @@ impl PdfViewer {
                 .into_iter()
                 .zip(self.doc.pages().unwrap())
                 .enumerate()
-                .filter(|(_, (r, page))| viewport_rect.intersects(r))
+                .filter(|(_, (r, _page))| viewport_rect.intersects(r))
                 .map(|(i, (r, page))| {
-                    let page = page.unwrap();
-                    let bounds = page.bounds().unwrap();
-                    let mut pix = Pixmap::new_with_w_h(
-                        &Colorspace::device_rgb(),
-                        bounds.width() as i32,
-                        bounds.height() as i32,
-                        true,
-                    )
-                    .unwrap();
-                    pix.samples_mut().fill(255);
-                    let device = Device::from_pixmap(&mut pix).unwrap();
-                    self.display_lists[i]
-                        .run(&device, &Matrix::IDENTITY, bounds)
+                    let key = (i, (self.scale * self.fractional_scaling).to_bits());
+                    let mut cache = self.pixmaps.borrow_mut();
+                    if !cache.contains_key(&key) {
+                        let page = page.unwrap();
+                        let bounds = page.bounds().unwrap();
+                        let mut pix = Pixmap::new_with_w_h(
+                            &Colorspace::device_rgb(),
+                            bounds.width() as i32,
+                            bounds.height() as i32,
+                            true,
+                        )
                         .unwrap();
-
+                        pix.samples_mut().fill(255);
+                        let device = Device::from_pixmap(&mut pix).unwrap();
+                        self.display_lists[i]
+                            .run(&device, &Matrix::IDENTITY, bounds)
+                            .unwrap();
+                        cache.insert(key, Rc::new(pix));
+                    }
+                    let pix = Rc::clone(cache.get(&key).unwrap());
                     (pix, r)
                 })
                 .collect();
