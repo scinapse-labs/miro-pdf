@@ -26,6 +26,12 @@ use crate::{
     pdf::{PdfMessage, outline_extraction::OutlineItem, page_layout::PageLayout},
 };
 
+#[derive(Debug, Clone)]
+struct PageLink {
+    bounds: mupdf::Rect,
+    uri: String,
+}
+
 const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
@@ -240,6 +246,162 @@ impl<'a> widget::canvas::Program<PdfMessage> for SelectionOverlay<'a> {
     }
 }
 
+#[derive(Debug, Default)]
+struct LinkOverlayState {
+    pending_key: String,
+    was_active: bool,
+}
+
+#[derive(Debug)]
+struct LinkOverlay<'a> {
+    viewer: &'a PdfViewer,
+}
+
+impl<'a> LinkOverlay<'a> {
+    fn new(viewer: &'a PdfViewer) -> Self {
+        Self { viewer }
+    }
+}
+
+impl<'a> widget::canvas::Program<PdfMessage> for LinkOverlay<'a> {
+    type State = LinkOverlayState;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: canvas::Event,
+        _bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> (iced::event::Status, Option<PdfMessage>) {
+        if !self.viewer.show_link_hitboxes {
+            state.was_active = false;
+            return (iced::event::Status::Ignored, None);
+        }
+
+        if !state.was_active {
+            state.pending_key.clear();
+        }
+        state.was_active = true;
+
+        if let canvas::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            ..
+        }) = event
+        {
+            if modifiers.control() || modifiers.alt() || modifiers.logo() {
+                return (iced::event::Status::Ignored, None);
+            }
+
+            if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                return (
+                    iced::event::Status::Captured,
+                    Some(PdfMessage::CloseLinkHitboxes),
+                );
+            }
+
+            if let iced::keyboard::Key::Character(c) = key {
+                let ch = c.to_lowercase().to_string();
+                state.pending_key.push_str(&ch);
+
+                let viewport = *self.viewer.viewport.borrow();
+                let visible = self.viewer.visible_links(viewport);
+                let keys = generate_key_combinations(visible.len());
+
+                if let Some(idx) = keys.iter().position(|k| k == &state.pending_key) {
+                    state.pending_key.clear();
+                    return (
+                        iced::event::Status::Captured,
+                        Some(PdfMessage::ActivateLink(idx)),
+                    );
+                }
+
+                let is_prefix = keys.iter().any(|k| k.starts_with(&state.pending_key));
+                if is_prefix {
+                    return (iced::event::Status::Captured, None);
+                }
+
+                state.pending_key.clear();
+                return (iced::event::Status::Captured, None);
+            }
+        }
+
+        (iced::event::Status::Ignored, None)
+    }
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        *self.viewer.widget_position.borrow_mut() = bounds.position();
+        let viewport = bounds.size();
+        let visible = self.viewer.visible_links(viewport);
+        if visible.is_empty() && self.viewer.hovered_link.is_none() {
+            return Vec::new();
+        }
+
+        let mut frame = canvas::Frame::new(renderer, viewport);
+
+        if let Some((page_idx, link_idx)) = self.viewer.hovered_link {
+            if let Some((_, rect)) = visible
+                .iter()
+                .find(|((p, l), _)| *p == page_idx && *l == link_idx)
+            {
+                let mut color = iced::Color::from_rgb(0.0, 0.4, 0.8);
+                color.a = 0.15;
+                frame.fill_rectangle(rect.x0.into(), rect.size().into(), color);
+            }
+        }
+
+        if self.viewer.show_link_hitboxes {
+            let keys = generate_key_combinations(visible.len());
+            for (((_page_idx, _link_idx), rect), key) in visible.iter().zip(keys.iter()) {
+                let mut fill_color = iced::Color::from_rgb(0.9, 0.3, 0.1);
+                fill_color.a = 0.2;
+                frame.fill_rectangle(rect.x0.into(), rect.size().into(), fill_color);
+
+                let stroke_color = iced::Color::from_rgb(0.9, 0.3, 0.1);
+                frame.stroke_rectangle(
+                    rect.x0.into(),
+                    rect.size().into(),
+                    Stroke::default().with_color(stroke_color).with_width(1.5),
+                );
+
+                frame.fill_text(geometry::Text {
+                    content: key.clone(),
+                    position: rect.center().into(),
+                    color: iced::Color::BLACK,
+                    size: 16.0.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Center,
+                    vertical_alignment: iced::alignment::Vertical::Center,
+                    shaping: widget::text::Shaping::Basic,
+                });
+            }
+        }
+
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        _bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> iced::advanced::mouse::Interaction {
+        if self.viewer.hovered_link.is_some() {
+            iced::advanced::mouse::Interaction::Pointer
+        } else {
+            iced::advanced::mouse::Interaction::default()
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum MouseInteraction {
     None,
@@ -284,6 +446,13 @@ pub struct PdfViewer {
     layout: PageLayout,
 
     gradient_cache: [[u8; 4]; 256],
+
+    show_link_hitboxes: bool,
+    links: Vec<Vec<PageLink>>,
+    hovered_link: Option<(usize, usize)>,
+
+    /// The widget's position in window coordinates, updated each frame by the overlay draw.
+    widget_position: RefCell<iced::Point>,
 }
 
 impl PdfViewer {
@@ -295,12 +464,22 @@ impl PdfViewer {
             .to_string();
         let doc = mupdf::Document::open(&path.to_str().unwrap())?;
         let mut display_lists = vec![];
+        let mut links = vec![];
         for page in doc.pages()?.flatten() {
             let dl = mupdf::DisplayList::new(page.bounds()?)?;
             let dummy_device = Device::from_display_list(&dl)?;
             let ctm = Matrix::IDENTITY;
             page.run(&dummy_device, &ctm)?;
             display_lists.push(dl);
+
+            let page_links: Vec<PageLink> = page
+                .links()?
+                .map(|link| PageLink {
+                    bounds: link.bounds,
+                    uri: link.uri,
+                })
+                .collect();
+            links.push(page_links);
         }
 
         let bg_color = DARK_THEME
@@ -334,6 +513,10 @@ impl PdfViewer {
             selection_start: None,
             selection_end: None,
             selected_text: String::new(),
+            show_link_hitboxes: false,
+            links,
+            hovered_link: None,
+            widget_position: RefCell::new(iced::Point::new(0.0, 0.0)),
         })
     }
 
@@ -412,19 +595,22 @@ impl PdfViewer {
                 self.translation += vector;
             }
             PdfMessage::MouseMoved(vector) => {
+                let old_local = self.local_mouse_pos();
+                self.mouse_pos = vector;
+                let new_local = self.local_mouse_pos();
                 match self.mouse_interaction {
                     MouseInteraction::None => {}
                     MouseInteraction::Panning => {
                         out = iced::Task::done(PdfMessage::Move(
-                            (self.mouse_pos - vector)
+                            (old_local - new_local)
                                 .scaled(1.0 / (self.scale * self.fractional_scaling)),
                         ))
                     }
                     MouseInteraction::Selecting => {
-                        self.selection_end = Some(vector);
+                        self.selection_end = Some(new_local);
                     }
                 }
-                self.mouse_pos = vector;
+                self.update_hovered_link();
             }
             PdfMessage::MouseAction(mouse_action, pressed) => {
                 if pressed {
@@ -438,8 +624,9 @@ impl PdfViewer {
                         MouseAction::Selection => {
                             self.mouse_interaction = MouseInteraction::Selecting;
                             self.mouse_pressed_at = self.mouse_pos;
-                            self.selection_start = Some(self.mouse_pos);
-                            self.selection_end = Some(self.mouse_pos);
+                            let local = self.local_mouse_pos();
+                            self.selection_start = Some(local);
+                            self.selection_end = Some(local);
                             self.selected_text.clear();
                         }
                         MouseAction::NextPage => {
@@ -469,7 +656,15 @@ impl PdfViewer {
                     }
                 } else {
                     match self.mouse_interaction {
-                        MouseInteraction::None | MouseInteraction::Panning => {}
+                        MouseInteraction::None | MouseInteraction::Panning => {
+                            let dist_sq =
+                                (self.mouse_pos - self.mouse_pressed_at).norm_squared();
+                            if dist_sq < MIN_CLICK_DISTANCE * MIN_CLICK_DISTANCE {
+                                if let Some((page_idx, link_idx)) = self.hovered_link {
+                                    out = self.activate_link(page_idx, link_idx);
+                                }
+                            }
+                        }
                         MouseInteraction::Selecting => {
                             if let (Some(start), Some(end)) =
                                 (self.selection_start, self.selection_end)
@@ -491,9 +686,19 @@ impl PdfViewer {
                     self.mouse_interaction = MouseInteraction::None;
                 }
             }
-            PdfMessage::ToggleLinkHitboxes => {}
-            PdfMessage::ActivateLink(_) => {}
-            PdfMessage::CloseLinkHitboxes => {}
+            PdfMessage::ToggleLinkHitboxes => {
+                self.show_link_hitboxes = !self.show_link_hitboxes;
+            }
+            PdfMessage::ActivateLink(idx) => {
+                let viewport = *self.viewport.borrow();
+                let visible = self.visible_links(viewport);
+                if let Some(((page_idx, link_idx), _)) = visible.get(idx) {
+                    out = self.activate_link(*page_idx, *link_idx);
+                }
+            }
+            PdfMessage::CloseLinkHitboxes => {
+                self.show_link_hitboxes = false;
+            }
             PdfMessage::FileChanged => {}
             PdfMessage::PrintPdf => {}
             PdfMessage::None => {}
@@ -676,14 +881,22 @@ impl PdfViewer {
                 .into()
         });
 
-        let overlay = widget::canvas(SelectionOverlay::new(self))
+        let selection_overlay = widget::canvas(SelectionOverlay::new(self))
             .width(iced::Length::Fill)
             .height(iced::Length::Fill);
 
-        widget::Stack::with_children([pages.into(), overlay.into()])
+        let link_overlay = widget::canvas(LinkOverlay::new(self))
             .width(iced::Length::Fill)
-            .height(iced::Length::Fill)
-            .into()
+            .height(iced::Length::Fill);
+
+        widget::Stack::with_children([
+            pages.into(),
+            selection_overlay.into(),
+            link_overlay.into(),
+        ])
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .into()
     }
 
     pub fn extract_text_from_rect(&self, screen_rect: Rect<f32>) -> String {
@@ -757,6 +970,94 @@ impl PdfViewer {
             Vector::new(start.x.min(end.x), start.y.min(end.y)),
             Vector::new(start.x.max(end.x), start.y.max(end.y)),
         ))
+    }
+
+    fn visible_links(&self, viewport: iced::Size<f32>) -> Vec<((usize, usize), Rect<f32>)> {
+        let mut result = Vec::new();
+        let Ok(page_rects) = self.layout.pages_rects(
+            &self.doc,
+            self.translation.scaled(-1.0),
+            self.scale,
+            self.fractional_scaling,
+            viewport,
+        ) else {
+            return result;
+        };
+
+        let viewport_rect = Rect::from_pos_size(Vector::zero(), viewport.into());
+
+        for (page_idx, page_rect) in page_rects.iter().enumerate() {
+            if !viewport_rect.intersects(page_rect) {
+                continue;
+            }
+            let page_bounds = self.display_lists[page_idx].bounds();
+            let page_width = page_bounds.x1 - page_bounds.x0;
+            let page_height = page_bounds.y1 - page_bounds.y0;
+            if page_width <= 0.0 || page_height <= 0.0 {
+                continue;
+            }
+            let scale_x = page_rect.width() / page_width;
+            let scale_y = page_rect.height() / page_height;
+
+            for (link_idx, link) in self.links[page_idx].iter().enumerate() {
+                let screen_rect = Rect::from_points(
+                    Vector::new(
+                        page_rect.x0.x + (link.bounds.x0 - page_bounds.x0) * scale_x,
+                        page_rect.x0.y + (link.bounds.y0 - page_bounds.y0) * scale_y,
+                    ),
+                    Vector::new(
+                        page_rect.x0.x + (link.bounds.x1 - page_bounds.x0) * scale_x,
+                        page_rect.x0.y + (link.bounds.y1 - page_bounds.y0) * scale_y,
+                    ),
+                );
+                if viewport_rect.intersects(&screen_rect) {
+                    result.push(((page_idx, link_idx), screen_rect));
+                }
+            }
+        }
+        result
+    }
+
+    fn local_mouse_pos(&self) -> Vector<f32> {
+        let offset: Vector<f32> = (*self.widget_position.borrow()).into();
+        self.mouse_pos - offset
+    }
+
+    fn update_hovered_link(&mut self) {
+        let local_mouse = self.local_mouse_pos();
+        let viewport = *self.viewport.borrow();
+        let visible = self.visible_links(viewport);
+        self.hovered_link = visible
+            .iter()
+            .find(|(_, rect)| rect.contains(local_mouse))
+            .map(|((page_idx, link_idx), _)| (*page_idx, *link_idx));
+    }
+
+    fn activate_link(&mut self, page_idx: usize, link_idx: usize) -> iced::Task<PdfMessage> {
+        let Some(link) = self.links.get(page_idx).and_then(|p| p.get(link_idx)) else {
+            return iced::Task::none();
+        };
+
+        self.show_link_hitboxes = false;
+
+        if link.uri.starts_with("http://")
+            || link.uri.starts_with("https://")
+            || link.uri.starts_with("mailto:")
+        {
+            let _ = open::that(&link.uri);
+        } else if link.uri.starts_with("#page=") {
+            if let Some(page_str) = link.uri.strip_prefix("#page=") {
+                if let Ok(page_num) = page_str.parse::<usize>() {
+                    return iced::Task::done(PdfMessage::SetPage(page_num));
+                }
+            }
+        } else if link.uri.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(page_num) = link.uri.parse::<usize>() {
+                return iced::Task::done(PdfMessage::SetPage(page_num));
+            }
+        }
+
+        iced::Task::none()
     }
 
     pub fn page_count(&self) -> Result<i32> {
