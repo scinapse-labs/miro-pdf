@@ -203,7 +203,7 @@ pub struct PdfViewer {
     pub name: String,
     pub path: PathBuf,
 
-    pub invert_colors: bool,
+    invert_colors: bool,
     pub draw_page_borders: bool,
 
     doc: mupdf::Document,
@@ -531,7 +531,6 @@ impl PdfViewer {
                     let mut cache = self.render_cache.borrow_mut();
                     if !cache.contains_key(&key) {
                         let _span = tracy_client::span!("Pdf cache miss");
-                        debug!("Cache miss for page {}", i);
 
                         // Try to reuse a pixmap allocation for this page.
                         let mut pool = self.pixmap_pool.borrow_mut();
@@ -604,6 +603,13 @@ impl PdfViewer {
         self.fractional_scaling = scale_factor as f32;
     }
 
+    pub fn set_invert_colors(&mut self, invert_colors: bool) {
+        if self.invert_colors != invert_colors {
+            self.invert_colors = invert_colors;
+            self.render_cache.borrow_mut().clear();
+        }
+    }
+
     pub fn is_jumpable_action(&self, msg: &PdfMessage) -> bool {
         // TODO: Implement
         false
@@ -634,6 +640,7 @@ fn generate_gradient_cache(cache: &mut [[u8; 4]; 256], bg_color: &[u8; 4]) {
 }
 
 fn cpu_pdf_dark_mode_shader(pixmap: &mut mupdf::Pixmap, gradient_cache: &[[u8; 4]; 256]) {
+    let _span = tracy_client::span!("Cpu dark mode shader");
     let samples = pixmap.samples_mut();
     for pixel in samples.chunks_exact_mut(4) {
         let r: u16 = pixel[0] as u16;

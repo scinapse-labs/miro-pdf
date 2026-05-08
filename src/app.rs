@@ -223,6 +223,7 @@ impl App {
                 let out = match PdfViewer::from_path(path_buf.clone()) {
                     Ok(mut viewer) => {
                         viewer.set_scale_factor(self.scale_factor);
+                        viewer.set_invert_colors(self.invert_pdf);
                         self.pdfs.push(viewer);
                         iced::Task::done(AppMessage::OpenTab(self.pdfs.len() - 1))
                     }
@@ -341,7 +342,7 @@ impl App {
             AppMessage::ToggleDarkModePdf => {
                 self.invert_pdf = !self.invert_pdf;
                 for pdf in &mut self.pdfs {
-                    pdf.invert_colors = self.invert_pdf;
+                    pdf.set_invert_colors(self.invert_pdf);
                 }
                 iced::Task::none()
             }
