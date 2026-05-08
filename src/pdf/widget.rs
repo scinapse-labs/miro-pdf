@@ -1,11 +1,15 @@
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap},
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
+};
 
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
 use iced::{
-    Renderer, Size, Transformation,
+    Renderer, Size,
     advanced::{Renderer as _, graphics::geometry, image},
-    alignment::Horizontal,
     widget::{
         self,
         canvas::{self, Cache, Stroke},
@@ -43,6 +47,47 @@ impl AsRef<[u8]> for PixmapBytes {
     }
 }
 
+/// A pixel buffer that returns itself to a shared pool when dropped.
+#[derive(Debug)]
+struct PooledBuffer {
+    buf: Option<Vec<u8>>,
+    pool: Weak<Mutex<HashMap<usize, Vec<Vec<u8>>>>>,
+    page_idx: usize,
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref().expect("Buffer should not be None")
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            if let Some(pool) = self.pool.upgrade() {
+                if let Ok(mut pool) = pool.lock() {
+                    pool.entry(self.page_idx).or_default().push(buf);
+                }
+            }
+        }
+    }
+}
+
+type BufferPool = Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>;
+
+/// Cache key for rendered page images.
+///
+/// * `Full` is used when the entire page fits inside the viewport. The cached
+///   image is independent of translation so panning does not trigger re-renders.
+/// * `Partial` is used when only a sub-rect of the page is visible. The key
+///   includes the visible rectangle (in viewport pixels) so that any pan or
+///   zoom invalidates the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RenderKey {
+    Full(usize, u32),
+    Partial(usize, u32, i32, i32, i32, i32),
+}
+
 struct Document {
     cache: Cache,
     pages: Vec<(image::Handle, Rect<f32>)>,
@@ -77,6 +122,7 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
         bounds: iced::Rectangle,
         cursor: iced::advanced::mouse::Cursor,
     ) -> Vec<canvas::Geometry<Renderer>> {
+        let _span = tracy_client::span!("Pdf draw");
         let bg = self.cache.draw(renderer, bounds.size(), |frame| {
             for (handle, rect) in &self.pages {
                 let mut c = iced::Color::WHITE;
@@ -170,8 +216,6 @@ pub enum MouseInteraction {
 }
 
 /// A pixmap is cached by its page number and the zoom level at which it was generated.
-type PixmapKey = (usize, u32);
-
 /// Renders a pdf document. Owns all information related to the document.
 #[derive(Debug)]
 pub struct PdfViewer {
@@ -183,7 +227,12 @@ pub struct PdfViewer {
 
     doc: mupdf::Document,
     display_lists: Vec<mupdf::DisplayList>,
-    handles: RefCell<HashMap<PixmapKey, image::Handle>>,
+    /// Exact render cache: key includes visible rect for partial renders.
+    render_cache: RefCell<HashMap<RenderKey, image::Handle>>,
+    /// Reusable mupdf pixmaps (one per page). Only the most recent size is kept.
+    pixmap_pool: RefCell<HashMap<usize, Pixmap>>,
+    /// Shared pool of CPU buffers returned by dropped images.
+    buffer_pool: BufferPool,
 
     pub translation: Vector<f32>,
     pub scale: f32,
@@ -233,7 +282,9 @@ impl PdfViewer {
             draw_page_borders: true,
             doc,
             display_lists,
-            handles: RefCell::default(),
+            render_cache: RefCell::default(),
+            pixmap_pool: RefCell::default(),
+            buffer_pool: Arc::new(Mutex::new(HashMap::new())),
             translation: Vector::zero(),
             scale: 1.0,
             fractional_scaling: 1.0,
@@ -408,39 +459,150 @@ impl PdfViewer {
             let viewport_rect =
                 Rect::from_pos_size(Vector::zero(), Vector::new(size.width, size.height));
 
+            let effective_scale = self.scale * self.fractional_scaling;
+
+            // Drop pixmap allocations for pages that are no longer visible.
+            let visible_indices: Vec<usize> = rects
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| viewport_rect.intersects(r))
+                .map(|(i, _)| i)
+                .collect();
+            self.pixmap_pool
+                .borrow_mut()
+                .retain(|idx, _| visible_indices.contains(idx));
+
             let with_handles: Vec<_> = rects
                 .into_iter()
                 .zip(self.doc.pages().unwrap())
                 .enumerate()
                 .filter(|(_, (r, _page))| viewport_rect.intersects(r))
-                .map(|(i, (r, page))| {
-                    let key = (i, (self.scale * self.fractional_scaling).to_bits());
-                    let mut cache = self.handles.borrow_mut();
+                .map(|(i, (rect_ss, page))| {
+                    // rect_ss = A pages bounding box in screen coordinates (relative to the widgets origin)
+                    let page = page.unwrap();
+                    let page_bounds: Rect<f32> = page.bounds().unwrap().into();
+
+                    let fully_visible = rect_ss.x0.x >= 0.0
+                        && rect_ss.x1.x <= viewport_rect.x1.x
+                        && rect_ss.x0.y >= 0.0
+                        && rect_ss.x1.y <= viewport_rect.x1.y;
+
+                    let (key, draw_rect, w, h, matrix, scissor) = if fully_visible {
+                        let key = RenderKey::Full(i, effective_scale.to_bits());
+                        let w = rect_ss.width().ceil().max(1.0) as i32;
+                        let h = rect_ss.height().ceil().max(1.0) as i32;
+                        let tx = -page_bounds.x0.x * effective_scale;
+                        let ty = -page_bounds.x0.y * effective_scale;
+                        let matrix =
+                            Matrix::new(effective_scale, 0.0, 0.0, effective_scale, tx, ty);
+                        let scissor = mupdf::Rect::new(0.0, 0.0, w as f32, h as f32);
+                        (key, rect_ss, w, h, matrix, scissor)
+                    } else {
+                        let vis = rect_ss.intersect(&viewport_rect);
+                        let vw = vis.width().ceil().max(1.0) as i32;
+                        let vh = vis.height().ceil().max(1.0) as i32;
+
+                        let render_offset_x = rect_ss.x0.x - vis.x0.x;
+                        let render_offset_y = rect_ss.x0.y - vis.x0.y;
+
+                        // Round to integer pixels for the cache key. The
+                        // matrix uses the snapped value; the draw position is
+                        // adjusted by the rounding error so they stay in sync.
+                        let snapped_offset_x = render_offset_x.round();
+                        let snapped_offset_y = render_offset_y.round();
+
+                        let key = RenderKey::Partial(
+                            i,
+                            effective_scale.to_bits(),
+                            snapped_offset_x as i32,
+                            snapped_offset_y as i32,
+                            vw,
+                            vh,
+                        );
+
+                        let raster_tx = snapped_offset_x - page_bounds.x0.x * effective_scale;
+                        let raster_ty = snapped_offset_y - page_bounds.x0.y * effective_scale;
+                        let matrix = Matrix::new(
+                            effective_scale,
+                            0.0,
+                            0.0,
+                            effective_scale,
+                            raster_tx,
+                            raster_ty,
+                        );
+                        let scissor = mupdf::Rect::new(0.0, 0.0, vw as f32, vh as f32);
+
+                        // Compensate for snapping so the image is drawn at the
+                        // correct sub-pixel position. draw_x = r.x0.x - snapped_offset_x
+                        // which is the rounding error in [-0.5, 0.5].
+                        let draw_rect = Rect::from_pos_size(
+                            Vector::new(
+                                rect_ss.x0.x - snapped_offset_x,
+                                rect_ss.x0.y - snapped_offset_y,
+                            ),
+                            Vector::new(vw as f32, vh as f32),
+                        );
+
+                        (key, draw_rect, vw, vh, matrix, scissor)
+                    };
+
+                    let mut cache = self.render_cache.borrow_mut();
                     if !cache.contains_key(&key) {
+                        let _span = tracy_client::span!("Pdf cache miss");
                         debug!("Cache miss for page {}", i);
-                        let page = page.unwrap();
-                        let bounds = page.bounds().unwrap();
-                        let mut pix = Pixmap::new_with_w_h(
-                            &Colorspace::device_rgb(),
-                            bounds.width() as i32,
-                            bounds.height() as i32,
-                            true,
-                        )
-                        .unwrap();
+
+                        // Try to reuse a pixmap allocation for this page.
+                        let mut pool = self.pixmap_pool.borrow_mut();
+                        let mut pix = pool.remove(&i).unwrap_or_else(|| {
+                            Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true).unwrap()
+                        });
+
+                        // If the pooled pixmap has the wrong size, allocate a new one.
+                        if pix.width() as i32 != w || pix.height() as i32 != h {
+                            pix = Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true)
+                                .unwrap();
+                        }
+
                         pix.samples_mut().fill(255);
                         let device = Device::from_pixmap(&mut pix).unwrap();
                         self.display_lists[i]
-                            .run(&device, &Matrix::IDENTITY, bounds)
+                            .run(&device, &matrix, scissor)
                             .unwrap();
+
+                        if self.invert_colors {
+                            cpu_pdf_dark_mode_shader(&mut pix, &self.gradient_cache);
+                        }
+
+                        // TODO: This is NOT zero-copy. Can we make it?
+                        let samples = pix.samples();
+
+                        // Try to reuse a CPU buffer from the shared pool.
+                        let mut buf = self
+                            .buffer_pool
+                            .lock()
+                            .unwrap()
+                            .remove(&i)
+                            .and_then(|mut v| v.pop())
+                            .unwrap_or_else(|| Vec::with_capacity(samples.len()));
+                        // PERF: if samples.len() > buf.capacity() this results in a re-allocation
+                        buf.clear();
+                        buf.extend_from_slice(samples);
+                        // Return the mupdf pixmap to the pool for reuse.
+                        pool.insert(i, pix);
+
                         let handle = image::Handle::from_rgba(
-                            pix.width(),
-                            pix.height(),
-                            image::Bytes::from_owner(PixmapBytes(Arc::new(pix))),
+                            w as u32,
+                            h as u32,
+                            image::Bytes::from_owner(PooledBuffer {
+                                buf: Some(buf),
+                                pool: Arc::downgrade(&self.buffer_pool),
+                                page_idx: i,
+                            }),
                         );
                         cache.insert(key, handle);
                     }
                     let handle = cache.get(&key).unwrap().clone();
-                    (handle, r)
+                    (handle, draw_rect)
                 })
                 .collect();
 
