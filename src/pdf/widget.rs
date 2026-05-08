@@ -28,25 +28,6 @@ use crate::{
 const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
-/// `mupdf::Pixmap` is `Send` because it owns its own pixel buffer and is only
-/// accessed immutably here, so an `Arc` around it satisfies the `Send + 'static`
-/// bounds required by `iced::advanced::image::Bytes`.
-#[derive(Debug)]
-struct PixmapBytes(Arc<Pixmap>);
-
-// Safety: `Pixmap` owns its pixel buffer and we only access it immutably
-// (`samples()`). The underlying `*mut fz_pixmap` is never mutated after
-// the pixmap has been rendered, so it is safe to send the owned buffer
-// to another thread (e.g. the GPU upload thread used by iced).
-unsafe impl Send for PixmapBytes {}
-unsafe impl Sync for PixmapBytes {}
-
-impl AsRef<[u8]> for PixmapBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.0.samples()
-    }
-}
-
 /// A pixel buffer that returns itself to a shared pool when dropped.
 #[derive(Debug)]
 struct PooledBuffer {
@@ -77,9 +58,9 @@ type BufferPool = Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>;
 
 /// Cache key for rendered page images.
 ///
-/// * `Full` is used when the entire page fits inside the viewport. The cached
+/// - `Full` is used when the entire page fits inside the viewport. The cached
 ///   image is independent of translation so panning does not trigger re-renders.
-/// * `Partial` is used when only a sub-rect of the page is visible. The key
+/// - `Partial` is used when only a sub-rect of the page is visible. The key
 ///   includes the visible rectangle (in viewport pixels) so that any pan or
 ///   zoom invalidates the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -231,7 +212,8 @@ pub struct PdfViewer {
     render_cache: RefCell<HashMap<RenderKey, image::Handle>>,
     /// Reusable mupdf pixmaps (one per page). Only the most recent size is kept.
     pixmap_pool: RefCell<HashMap<usize, Pixmap>>,
-    /// Shared pool of CPU buffers returned by dropped images.
+    /// Shared pool of CPU buffers returned by dropped images. These can be shared across threads and
+    /// are sent to iced.
     buffer_pool: BufferPool,
 
     pub translation: Vector<f32>,
@@ -559,6 +541,7 @@ impl PdfViewer {
 
                         // If the pooled pixmap has the wrong size, allocate a new one.
                         if pix.width() as i32 != w || pix.height() as i32 != h {
+                            let _span = tracy_client::span!("Pixmap bounds mismatch");
                             pix = Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true)
                                 .unwrap();
                         }
@@ -576,6 +559,10 @@ impl PdfViewer {
                         // TODO: This is NOT zero-copy. Can we make it?
                         let samples = pix.samples();
 
+                        // NOTE: We have to copy the data at least once since the mupdf structures
+                        // NOTE: and their associated data aren't thread safe. Iced could render
+                        // NOTE: them on any thread without my control
+
                         // Try to reuse a CPU buffer from the shared pool.
                         let mut buf = self
                             .buffer_pool
@@ -584,7 +571,6 @@ impl PdfViewer {
                             .remove(&i)
                             .and_then(|mut v| v.pop())
                             .unwrap_or_else(|| Vec::with_capacity(samples.len()));
-                        // PERF: if samples.len() > buf.capacity() this results in a re-allocation
                         buf.clear();
                         buf.extend_from_slice(samples);
                         // Return the mupdf pixmap to the pool for reuse.
