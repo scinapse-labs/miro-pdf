@@ -371,11 +371,24 @@ impl<'a> widget::canvas::Program<PdfMessage> for LinkOverlay<'a> {
                     Stroke::default().with_color(stroke_color).with_width(1.5),
                 );
 
+                let text_size = 16.0;
+                let padding = 3.0;
+                let approx_char_w = text_size * 0.6;
+                let bg_w = approx_char_w * key.len() as f32 + padding * 2.0;
+                let bg_h = text_size + padding;
+                let bg_x = rect.x1.x + 2.0;
+                let bg_y = rect.center().y - bg_h / 2.0;
+                frame.fill_rectangle(
+                    iced::Point::new(bg_x, bg_y),
+                    iced::Size::new(bg_w, bg_h),
+                    iced::Color::from_rgb(0.1, 0.1, 0.1),
+                );
+
                 frame.fill_text(geometry::Text {
                     content: key.clone(),
-                    position: rect.center().into(),
-                    color: iced::Color::BLACK,
-                    size: 16.0.into(),
+                    position: iced::Point::new(bg_x + bg_w / 2.0, bg_y + bg_h / 2.0),
+                    color: iced::Color::WHITE,
+                    size: text_size.into(),
                     line_height: widget::text::LineHeight::Relative(1.0),
                     font: iced::Font::default(),
                     horizontal_alignment: iced::alignment::Horizontal::Center,
