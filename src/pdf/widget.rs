@@ -30,6 +30,7 @@ use crate::{
 struct PageLink {
     bounds: mupdf::Rect,
     uri: String,
+    dest: Option<mupdf::link::LinkDestination>,
 }
 
 const MIN_SELECTION: f32 = 5.0;
@@ -490,6 +491,7 @@ impl PdfViewer {
                 .map(|link| PageLink {
                     bounds: link.bounds,
                     uri: link.uri,
+                    dest: link.dest,
                 })
                 .collect();
             links.push(page_links);
@@ -570,7 +572,7 @@ impl PdfViewer {
                 self.translation.y += prev.center().y - current.center().y;
             }
             PdfMessage::SetPage(idx) => {
-                if idx < page_count && idx > 0 && page_count > 0 {
+                if idx < page_count {
                     if let Ok(translation) = self.layout.translation_for_page(
                         &self.doc,
                         self.scale,
@@ -1058,15 +1060,24 @@ impl PdfViewer {
             || link.uri.starts_with("mailto:")
         {
             let _ = open::that(&link.uri);
+        } else if let Some(dest) = link.dest {
+            let page_num = dest.loc.page_number as usize;
+            if page_num < self.doc.page_count().unwrap() as usize {
+                return iced::Task::done(PdfMessage::SetPage(page_num));
+            }
         } else if link.uri.starts_with("#page=") {
             if let Some(page_str) = link.uri.strip_prefix("#page=") {
                 if let Ok(page_num) = page_str.parse::<usize>() {
-                    return iced::Task::done(PdfMessage::SetPage(page_num));
+                    if page_num > 0 {
+                        return iced::Task::done(PdfMessage::SetPage(page_num - 1));
+                    }
                 }
             }
         } else if link.uri.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(page_num) = link.uri.parse::<usize>() {
-                return iced::Task::done(PdfMessage::SetPage(page_num));
+                if page_num > 0 {
+                    return iced::Task::done(PdfMessage::SetPage(page_num - 1));
+                }
             }
         }
 

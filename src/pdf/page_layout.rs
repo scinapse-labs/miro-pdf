@@ -187,10 +187,11 @@ impl PageLayout {
         viewport: Size<f32>,
     ) -> Result<Vector<f32>> {
         let rects = self.pages_rects(doc, Vector::zero(), scale, fractional_scale, viewport)?;
-        rects
+        let rect = rects
             .get(page_idx)
-            .map(|rect| rect.center())
-            .ok_or(anyhow!("Page index {page_idx} out of bounds"))
+            .ok_or(anyhow!("Page index {page_idx} out of bounds"))?;
+        let viewport_center = Vector::new(viewport.width, viewport.height).scaled(0.5);
+        Ok((rect.center() - viewport_center).scaled(1.0 / (scale * fractional_scale)))
     }
 
     pub fn current_page_index(
@@ -266,5 +267,45 @@ impl PageLayout {
         })
         .clamp(0, rects.len() - 1);
         Ok(rects[idx])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mupdf::Document;
+
+    #[test]
+    fn test_translation_for_page() -> Result<()> {
+        let doc = Document::open("assets/links.pdf")?;
+        let layout = PageLayout::SinglePage;
+        let viewport = Size::new(800.0, 600.0);
+        let scale = 1.0;
+        let fractional_scale = 1.0;
+
+        let t0 = layout.translation_for_page(&doc, scale, fractional_scale, 0, viewport)?;
+        let t1 = layout.translation_for_page(&doc, scale, fractional_scale, 1, viewport)?;
+        let t2 = layout.translation_for_page(&doc, scale, fractional_scale, 2, viewport)?;
+
+        // Page 0 should need minimal/no translation to be centered
+        // (it's already centered when translation=0)
+        assert!(t0.norm_squared() < 1.0, "Page 0 should be near viewport center with zero translation, got {:?}", t0);
+
+        // Page 1 is below the viewport center, so we need positive y translation
+        // (self.translation is negated before being passed to pages_rects in view())
+        assert!(t1.y > t0.y, "Page 1 should require positive y translation, got {:?}", t1);
+
+        // Page 2 is even further down
+        assert!(t2.y > t1.y, "Page 2 should require more positive y translation than page 1, got {:?}", t2);
+
+        // Verify that applying the NEGATED translation to pages_rects centers the page
+        // (view() passes -self.translation to pages_rects)
+        let rects = layout.pages_rects(&doc, -t1, scale, fractional_scale, viewport)?;
+        let viewport_center = Vector::new(viewport.width, viewport.height).scaled(0.5);
+        let page1_center = rects[1].center();
+        let diff = (page1_center - viewport_center).norm_squared();
+        assert!(diff < 1.0, "Page 1 should be centered after applying -translation, got center {:?}, viewport center {:?}", page1_center, viewport_center);
+
+        Ok(())
     }
 }
