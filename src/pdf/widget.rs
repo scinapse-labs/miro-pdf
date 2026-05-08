@@ -15,6 +15,7 @@ use iced::{
         canvas::{self, Cache, Stroke},
     },
 };
+use iced_aw::style::colors::RED;
 use mupdf::{Colorspace, Device, Matrix, Pixmap};
 use tracing::debug;
 
@@ -54,6 +55,8 @@ impl Drop for PooledBuffer {
     }
 }
 
+// TODO(Next): Selection and links
+
 type BufferPool = Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>;
 
 /// Cache key for rendered page images.
@@ -72,6 +75,7 @@ enum RenderKey {
 struct Document {
     cache: Cache,
     pages: Vec<(image::Handle, Rect<f32>)>,
+    selection: Option<Rect<f32>>,
 }
 
 impl std::fmt::Debug for Document {
@@ -79,15 +83,17 @@ impl std::fmt::Debug for Document {
         f.debug_struct("Document")
             .field("cache", &self.cache)
             .field("page_count", &self.pages.len())
+            .field("selection", &self.selection)
             .finish()
     }
 }
 
 impl Document {
-    pub fn new(pages: Vec<(image::Handle, Rect<f32>)>) -> Self {
+    pub fn new(pages: Vec<(image::Handle, Rect<f32>)>, selection: Option<Rect<f32>>) -> Self {
         Self {
             cache: Cache::default(),
             pages,
+            selection,
         }
     }
 }
@@ -178,6 +184,11 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                 let bounds: iced::Rectangle = (*rect).into();
                 frame.draw_image(bounds, handle);
             }
+
+            if let Some(selection) = self.selection {
+                frame.fill_rectangle(selection.x0.into(), selection.size().into(), RED);
+            }
+
             let bounds_size = Vector::new(bounds.size().width, bounds.size().height).scaled(0.5);
             frame.fill_rectangle(
                 (bounds_size - Vector::new(2.0, 2.0)).into(),
@@ -225,6 +236,10 @@ pub struct PdfViewer {
     mouse_pos: Vector<f32>,
     mouse_pressed_at: Vector<f32>,
     mouse_interaction: MouseInteraction,
+
+    selection_start: Option<Vector<f32>>,
+    selection_end: Option<Vector<f32>>,
+    selected_text: String,
 
     layout: PageLayout,
 
@@ -276,6 +291,9 @@ impl PdfViewer {
             mouse_pos: Vector::zero(),
             mouse_pressed_at: Vector::zero(),
             mouse_interaction: MouseInteraction::None,
+            selection_start: None,
+            selection_end: None,
+            selected_text: String::new(),
         })
     }
 
@@ -362,7 +380,9 @@ impl PdfViewer {
                                 .scaled(1.0 / (self.scale * self.fractional_scaling)),
                         ))
                     }
-                    MouseInteraction::Selecting => todo!(),
+                    MouseInteraction::Selecting => {
+                        self.selection_end = Some(vector);
+                    }
                 }
                 self.mouse_pos = vector;
             }
@@ -372,10 +392,15 @@ impl PdfViewer {
                         MouseAction::Panning => {
                             self.mouse_interaction = MouseInteraction::Panning;
                             self.mouse_pressed_at = self.mouse_pos;
+                            self.selection_start = None;
+                            self.selection_end = None;
                         }
                         MouseAction::Selection => {
                             self.mouse_interaction = MouseInteraction::Selecting;
                             self.mouse_pressed_at = self.mouse_pos;
+                            self.selection_start = Some(self.mouse_pos);
+                            self.selection_end = Some(self.mouse_pos);
+                            self.selected_text.clear();
                         }
                         MouseAction::NextPage => {
                             out = iced::Task::done(PdfMessage::PageDown);
@@ -406,7 +431,21 @@ impl PdfViewer {
                     match self.mouse_interaction {
                         MouseInteraction::None | MouseInteraction::Panning => {}
                         MouseInteraction::Selecting => {
-                            // TODO: Copy text
+                            if let (Some(start), Some(end)) =
+                                (self.selection_start, self.selection_end)
+                            {
+                                let min = Vector::new(start.x.min(end.x), start.y.min(end.y));
+                                let max = Vector::new(start.x.max(end.x), start.y.max(end.y));
+                                if (max - min).norm_squared() >= MIN_SELECTION * MIN_SELECTION {
+                                    let selection_rect = Rect::from_points(min, max);
+                                    self.selected_text =
+                                        self.extract_text_from_rect(selection_rect);
+                                    debug!("Selected text: {}", self.selected_text);
+                                } else {
+                                    self.selection_start = None;
+                                    self.selection_end = None;
+                                }
+                            }
                         }
                     }
                     self.mouse_interaction = MouseInteraction::None;
@@ -591,12 +630,96 @@ impl PdfViewer {
                 })
                 .collect();
 
-            widget::canvas(Document::new(with_handles))
+            let selection = self
+                .selection_start
+                .zip(self.selection_end)
+                .map(|(start, end)| {
+                    Rect::from_points(
+                        Vector::new(start.x.min(end.x), start.y.min(end.y)),
+                        Vector::new(start.x.max(end.x), start.y.max(end.y)),
+                    )
+                });
+
+            widget::canvas(Document::new(with_handles, selection))
                 .width(iced::Length::Fill)
                 .height(iced::Length::Fill)
                 .into()
         })
         .into()
+    }
+
+    pub fn extract_text_from_rect(&self, screen_rect: Rect<f32>) -> String {
+        use mupdf::TextPageFlags;
+
+        let effective_scale = self.scale * self.fractional_scaling;
+        let viewport = *self.viewport.borrow();
+
+        let Ok(rects) = self.layout.pages_rects(
+            &self.doc,
+            self.translation.scaled(-1.0),
+            self.scale,
+            self.fractional_scaling,
+            viewport,
+        ) else {
+            return String::new();
+        };
+
+        let mut result = String::new();
+
+        for (i, page_rect) in rects.iter().enumerate() {
+            let intersect = screen_rect.intersect(page_rect);
+            if intersect.width() <= 0.0 || intersect.height() <= 0.0 {
+                continue;
+            }
+
+            let page_bounds = self.display_lists[i].bounds();
+
+            let pdf_rect = mupdf::Rect::new(
+                (intersect.x0.x - page_rect.x0.x) / effective_scale + page_bounds.x0,
+                (intersect.x0.y - page_rect.x0.y) / effective_scale + page_bounds.y0,
+                (intersect.x1.x - page_rect.x0.x) / effective_scale + page_bounds.x0,
+                (intersect.x1.y - page_rect.x0.y) / effective_scale + page_bounds.y0,
+            );
+
+            let Ok(text_page) = self.display_lists[i].to_text_page(TextPageFlags::empty()) else {
+                continue;
+            };
+
+            for block in text_page.blocks() {
+                for line in block.lines() {
+                    let line_bounds = line.bounds();
+                    if !rectangles_intersect(pdf_rect, line_bounds) {
+                        continue;
+                    }
+                    for ch in line.chars() {
+                        let quad = ch.quad();
+                        let char_rect =
+                            mupdf::Rect::new(quad.ul.x, quad.ul.y, quad.lr.x, quad.lr.y);
+                        if rectangles_intersect(pdf_rect, char_rect) {
+                            if let Some(c) = ch.char() {
+                                result.push(c);
+                            }
+                        }
+                    }
+                    result.push('\n');
+                }
+            }
+        }
+
+        result.trim().to_string()
+    }
+
+    pub fn selected_text(&self) -> &str {
+        &self.selected_text
+    }
+
+    pub fn page_count(&self) -> Result<i32> {
+        Ok(self.doc.page_count()?)
+    }
+
+    #[cfg(test)]
+    pub fn set_viewport_for_test(&mut self, size: iced::Size) {
+        *self.viewport.borrow_mut() = size;
     }
 
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
@@ -640,6 +763,7 @@ fn generate_gradient_cache(cache: &mut [[u8; 4]; 256], bg_color: &[u8; 4]) {
 }
 
 fn cpu_pdf_dark_mode_shader(pixmap: &mut mupdf::Pixmap, gradient_cache: &[[u8; 4]; 256]) {
+    // PERF: Slow in debug builds but more than fast enough in release builds.
     let _span = tracy_client::span!("Cpu dark mode shader");
     let samples = pixmap.samples_mut();
     for pixel in samples.chunks_exact_mut(4) {
@@ -650,6 +774,10 @@ fn cpu_pdf_dark_mode_shader(pixmap: &mut mupdf::Pixmap, gradient_cache: &[[u8; 4
         let pixel_array: &mut [u8; 4] = pixel.try_into().unwrap();
         *pixel_array = gradient_cache[brightness];
     }
+}
+
+fn rectangles_intersect(a: mupdf::Rect, b: mupdf::Rect) -> bool {
+    a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0
 }
 
 fn generate_key_combinations(count: usize) -> Vec<String> {
