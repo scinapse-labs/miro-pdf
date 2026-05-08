@@ -15,7 +15,7 @@ use iced::{
         canvas::{self, Cache, Stroke},
     },
 };
-use iced_aw::style::colors::RED;
+
 use mupdf::{Colorspace, Device, Matrix, Pixmap};
 use tracing::debug;
 
@@ -75,7 +75,6 @@ enum RenderKey {
 struct Document {
     cache: Cache,
     pages: Vec<(image::Handle, Rect<f32>)>,
-    selection: Option<Rect<f32>>,
 }
 
 impl std::fmt::Debug for Document {
@@ -83,17 +82,15 @@ impl std::fmt::Debug for Document {
         f.debug_struct("Document")
             .field("cache", &self.cache)
             .field("page_count", &self.pages.len())
-            .field("selection", &self.selection)
             .finish()
     }
 }
 
 impl Document {
-    pub fn new(pages: Vec<(image::Handle, Rect<f32>)>, selection: Option<Rect<f32>>) -> Self {
+    pub fn new(pages: Vec<(image::Handle, Rect<f32>)>) -> Self {
         Self {
             cache: Cache::default(),
             pages,
-            selection,
         }
     }
 }
@@ -185,10 +182,6 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                 frame.draw_image(bounds, handle);
             }
 
-            if let Some(selection) = self.selection {
-                frame.fill_rectangle(selection.x0.into(), selection.size().into(), RED);
-            }
-
             let bounds_size = Vector::new(bounds.size().width, bounds.size().height).scaled(0.5);
             frame.fill_rectangle(
                 (bounds_size - Vector::new(2.0, 2.0)).into(),
@@ -197,6 +190,53 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
             );
         });
         vec![bg]
+    }
+}
+
+#[derive(Debug)]
+struct SelectionOverlay<'a> {
+    viewer: &'a PdfViewer,
+}
+
+impl<'a> SelectionOverlay<'a> {
+    fn new(viewer: &'a PdfViewer) -> Self {
+        Self { viewer }
+    }
+}
+
+impl<'a> widget::canvas::Program<PdfMessage> for SelectionOverlay<'a> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        let Some(selection) = self.viewer.selection_rect() else {
+            return Vec::new();
+        };
+
+        let viewport = bounds.size();
+        let Ok(page_rects) = self.viewer.layout.pages_rects(
+            &self.viewer.doc,
+            self.viewer.translation.scaled(-1.0),
+            self.viewer.scale,
+            self.viewer.fractional_scaling,
+            viewport,
+        ) else {
+            return Vec::new();
+        };
+
+        let mut frame = canvas::Frame::new(renderer, viewport);
+
+        let mut color = iced::Color::from_rgb(0.0, 0.4, 0.8);
+        color.a = 0.25;
+        frame.fill_rectangle(selection.x0.into(), selection.size().into(), color);
+
+        vec![frame.into_geometry()]
     }
 }
 
@@ -462,7 +502,7 @@ impl PdfViewer {
     }
 
     pub fn view(&self) -> iced::Element<'_, PdfMessage> {
-        widget::responsive(|size| {
+        let pages = widget::responsive(|size| {
             {
                 let mut viewport = self.viewport.borrow_mut();
                 *viewport = size;
@@ -630,22 +670,20 @@ impl PdfViewer {
                 })
                 .collect();
 
-            let selection = self
-                .selection_start
-                .zip(self.selection_end)
-                .map(|(start, end)| {
-                    Rect::from_points(
-                        Vector::new(start.x.min(end.x), start.y.min(end.y)),
-                        Vector::new(start.x.max(end.x), start.y.max(end.y)),
-                    )
-                });
-
-            widget::canvas(Document::new(with_handles, selection))
+            widget::canvas(Document::new(with_handles))
                 .width(iced::Length::Fill)
                 .height(iced::Length::Fill)
                 .into()
-        })
-        .into()
+        });
+
+        let overlay = widget::canvas(SelectionOverlay::new(self))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill);
+
+        widget::Stack::with_children([pages.into(), overlay.into()])
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
     }
 
     pub fn extract_text_from_rect(&self, screen_rect: Rect<f32>) -> String {
@@ -711,6 +749,14 @@ impl PdfViewer {
 
     pub fn selected_text(&self) -> &str {
         &self.selected_text
+    }
+
+    fn selection_rect(&self) -> Option<Rect<f32>> {
+        let (start, end) = (self.selection_start?, self.selection_end?);
+        Some(Rect::from_points(
+            Vector::new(start.x.min(end.x), start.y.min(end.y)),
+            Vector::new(start.x.max(end.x), start.y.max(end.y)),
+        ))
     }
 
     pub fn page_count(&self) -> Result<i32> {
