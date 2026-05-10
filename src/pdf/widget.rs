@@ -1,89 +1,455 @@
+use std::{
+    cell::RefCell,
+    collections::{HashMap},
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
+};
+
 use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
-use mupdf::{Colorspace, Device, DisplayList, Document, Matrix, Page, Pixmap};
-use std::{cell::RefCell, path::PathBuf};
-use tracing::{error, info};
-use open;
+use iced::{
+    Renderer, Size,
+    advanced::{graphics::geometry, image},
+    widget::{
+        self,
+        canvas::{self, Cache, Stroke},
+    },
+};
+
+use mupdf::{Colorspace, Device, Matrix, Pixmap};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, error};
 
 use crate::{
-    config::MouseAction,
-    geometry::{self, Rect, Vector},
-    pdf::{
-        link_extraction::{LinkExtractor, LinkType},
-        outline_extraction::OutlineExtractor,
-        text_extraction::TextExtractor,
-    },
-    CONFIG, DARK_THEME,
+    DARK_THEME,
+    config::{MOVE_STEP, MouseAction},
+    geometry::{Rect, Vector},
+    pdf::{PdfMessage, page_layout::PageLayout},
 };
 
-use super::{
-    PdfMessage,
-    inner::{self, PageViewer},
-    link_extraction::LinkInfo,
-    outline_extraction::OutlineItem,
-};
+#[derive(Debug, Clone)]
+struct PageLink {
+    bounds: mupdf::Rect,
+    uri: String,
+    dest: Option<mupdf::link::LinkDestination>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlineItem {
+    pub title: String,
+    pub page: Option<u32>,
+    pub level: u32,
+    pub children: Vec<OutlineItem>,
+}
 
 const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
+/// A pixel buffer that returns itself to a shared pool when dropped.
+///
+/// Allocation pressure is the motivating concern: a single 4K page at 2× scale
+/// is ~64 MiB of RGBA data. Doing that per frame during zoom or pan causes
+/// severe allocator churn, so the pool turns allocation into zero-cost reuse
+/// after warmup.
+#[derive(Debug)]
+struct PooledBuffer {
+    buf: Option<Vec<u8>>,
+    pool: Weak<Mutex<HashMap<usize, Vec<Vec<u8>>>>>,
+    page_idx: usize,
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref().expect("Buffer should not be None")
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        // Returning the buffer on Drop lets us recycle the allocation without
+        // forcing callers to manage a manual release path.
+        if let Some(buf) = self.buf.take()
+            && let Some(pool) = self.pool.upgrade()
+            && let Ok(mut pool) = pool.lock()
+        {
+            pool.entry(self.page_idx).or_default().push(buf);
+        }
+    }
+}
+
+type BufferPool = Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>;
+
+/// Cache key for rendered page images.
+///
+/// - `Full` is used when the entire page fits inside the viewport. The cached
+///   image is independent of translation so panning does not trigger re-renders.
+/// - `Partial` is used when only a sub-rect of the page is visible. The key
+///   includes the visible rectangle (in viewport pixels) so that any pan or
+///   zoom invalidates the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RenderKey {
+    Full(usize, u32),
+    Partial(usize, u32, i32, i32, i32, i32),
+}
+
+struct Document {
+    cache: Cache,
+    pages: Vec<(image::Handle, Rect<f32>)>,
+    draw_page_borders: bool,
+    pdf_dark_mode: bool,
+}
+
+impl std::fmt::Debug for Document {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Document")
+            .field("cache", &self.cache)
+            .field("page_count", &self.pages.len())
+            .finish()
+    }
+}
+
+impl Document {
+    pub fn new(
+        pages: Vec<(image::Handle, Rect<f32>)>,
+        draw_page_borders: bool,
+        pdf_dark_mode: bool,
+    ) -> Self {
+        Self {
+            cache: Cache::default(),
+            pages,
+            draw_page_borders,
+            pdf_dark_mode,
+        }
+    }
+}
+
+impl widget::canvas::Program<PdfMessage> for Document {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        let _span = tracy_client::span!("Pdf draw");
+        let bg = self.cache.draw(renderer, bounds.size(), |frame| {
+            let bg_color = get_pdf_background_color(self.pdf_dark_mode, self.draw_page_borders);
+            frame.fill_rectangle(iced::Point::new(0.0, 0.0), bounds.size(), bg_color);
+
+            for (handle, rect) in &self.pages {
+                let bounds: iced::Rectangle = (*rect).into();
+                frame.draw_image(bounds, handle);
+            }
+        });
+        vec![bg]
+    }
+}
+
+#[derive(Debug)]
+struct SelectionOverlay<'a> {
+    viewer: &'a PdfViewer,
+}
+
+impl<'a> SelectionOverlay<'a> {
+    fn new(viewer: &'a PdfViewer) -> Self {
+        Self { viewer }
+    }
+}
+
+impl<'a> widget::canvas::Program<PdfMessage> for SelectionOverlay<'a> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        let Some(selection) = self.viewer.selection_rect() else {
+            return Vec::new();
+        };
+
+        let viewport = bounds.size();
+
+        let mut frame = canvas::Frame::new(renderer, viewport);
+
+        let mut color = iced::Color::from_rgb(0.0, 0.4, 0.8);
+        color.a = 0.25;
+        frame.fill_rectangle(selection.x0.into(), selection.size().into(), color);
+
+        vec![frame.into_geometry()]
+    }
+}
+
+#[derive(Debug, Default)]
+struct LinkOverlayState {
+    pending_key: String,
+    was_active: bool,
+}
+
+#[derive(Debug)]
+struct LinkOverlay<'a> {
+    viewer: &'a PdfViewer,
+}
+
+impl<'a> LinkOverlay<'a> {
+    fn new(viewer: &'a PdfViewer) -> Self {
+        Self { viewer }
+    }
+}
+
+impl<'a> widget::canvas::Program<PdfMessage> for LinkOverlay<'a> {
+    type State = LinkOverlayState;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: canvas::Event,
+        _bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> (iced::event::Status, Option<PdfMessage>) {
+        if !self.viewer.show_link_hitboxes {
+            state.was_active = false;
+            return (iced::event::Status::Ignored, None);
+        }
+
+        if !state.was_active {
+            state.pending_key.clear();
+        }
+        state.was_active = true;
+
+        if let canvas::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key, modifiers, ..
+        }) = event
+        {
+            if modifiers.control() || modifiers.alt() || modifiers.logo() {
+                return (iced::event::Status::Ignored, None);
+            }
+
+            if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) {
+                return (
+                    iced::event::Status::Captured,
+                    Some(PdfMessage::CloseLinkHitboxes),
+                );
+            }
+
+            if let iced::keyboard::Key::Character(c) = key {
+                let ch = c.to_lowercase().to_string();
+                state.pending_key.push_str(&ch);
+
+                let viewport = *self.viewer.viewport.borrow();
+                let visible = self.viewer.visible_links(viewport);
+                let keys = generate_key_combinations(visible.len());
+
+                if let Some(idx) = keys.iter().position(|k| k == &state.pending_key) {
+                    state.pending_key.clear();
+                    return (
+                        iced::event::Status::Captured,
+                        Some(PdfMessage::ActivateLink(idx)),
+                    );
+                }
+
+                let is_prefix = keys.iter().any(|k| k.starts_with(&state.pending_key));
+                if is_prefix {
+                    return (iced::event::Status::Captured, None);
+                }
+
+                state.pending_key.clear();
+                return (iced::event::Status::Captured, None);
+            }
+        }
+
+        (iced::event::Status::Ignored, None)
+    }
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &iced::Theme,
+        bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry<Renderer>> {
+        *self.viewer.widget_position.borrow_mut() = bounds.position();
+        let viewport = bounds.size();
+        let visible = self.viewer.visible_links(viewport);
+        if visible.is_empty() && self.viewer.hovered_link.is_none() {
+            return Vec::new();
+        }
+
+        let mut frame = canvas::Frame::new(renderer, viewport);
+
+        if let Some((page_idx, link_idx)) = self.viewer.hovered_link
+            && let Some((_, rect)) = visible
+                .iter()
+                .find(|((p, l), _)| *p == page_idx && *l == link_idx)
+        {
+            let mut color = iced::Color::from_rgb(0.0, 0.4, 0.8);
+            color.a = 0.15;
+            frame.fill_rectangle(rect.x0.into(), rect.size().into(), color);
+        }
+
+        if self.viewer.show_link_hitboxes {
+            let keys = generate_key_combinations(visible.len());
+            for (((_page_idx, _link_idx), rect), key) in visible.iter().zip(keys.iter()) {
+                let mut fill_color = iced::Color::from_rgb(0.9, 0.3, 0.1);
+                fill_color.a = 0.2;
+                frame.fill_rectangle(rect.x0.into(), rect.size().into(), fill_color);
+
+                let stroke_color = iced::Color::from_rgb(0.9, 0.3, 0.1);
+                frame.stroke_rectangle(
+                    rect.x0.into(),
+                    rect.size().into(),
+                    Stroke::default().with_color(stroke_color).with_width(1.5),
+                );
+
+                let text_size = 16.0;
+                let padding = 3.0;
+                let approx_char_w = text_size * 0.6;
+                let bg_w = approx_char_w * key.len() as f32 + padding * 2.0;
+                let bg_h = text_size + padding;
+                let bg_x = rect.x1.x + 2.0;
+                let bg_y = rect.center().y - bg_h / 2.0;
+                frame.fill_rectangle(
+                    iced::Point::new(bg_x, bg_y),
+                    iced::Size::new(bg_w, bg_h),
+                    iced::Color::from_rgb(0.1, 0.1, 0.1),
+                );
+
+                frame.fill_text(geometry::Text {
+                    content: key.clone(),
+                    position: iced::Point::new(bg_x + bg_w / 2.0, bg_y + bg_h / 2.0),
+                    color: iced::Color::WHITE,
+                    size: text_size.into(),
+                    line_height: widget::text::LineHeight::Relative(1.0),
+                    font: iced::Font::default(),
+                    horizontal_alignment: iced::alignment::Horizontal::Center,
+                    vertical_alignment: iced::alignment::Vertical::Center,
+                    shaping: widget::text::Shaping::Basic,
+                });
+            }
+        }
+
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        _bounds: iced::Rectangle,
+        _cursor: iced::advanced::mouse::Cursor,
+    ) -> iced::advanced::mouse::Interaction {
+        if self.viewer.hovered_link.is_some() {
+            iced::advanced::mouse::Interaction::Pointer
+        } else {
+            iced::advanced::mouse::Interaction::default()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum MouseInteraction {
+    None,
+    Panning,
+    Selecting,
+}
+
+/// A pixmap is cached by its page number and the zoom level at which it was generated.
 /// Renders a pdf document. Owns all information related to the document.
 #[derive(Debug)]
 pub struct PdfViewer {
     pub name: String,
     pub path: PathBuf,
-    pub label: String,
-    pub page_progress: String,
-    pub cur_page_idx: i32,
-    pub translation: Vector<f32>, // In document space
-    pub invert_colors: bool,
+
+    pdf_dark_mode: bool,
+    interface_dark_mode: bool,
     pub draw_page_borders: bool,
-    inner_state: RefCell<inner::State>,
-    /// Mouse position in screen space. Thus if the PdfViewer isn't positioned at the top left
-    /// corner of the screen, it must account for that offset.
-    last_mouse_pos: Option<Vector<f32>>,
-    /// Position where the mouse was pressed down, used to detect clicks vs pans
-    mouse_down_pos: Option<Vector<f32>>,
-    panning: bool,
-    scale: f32,
-    /// Factor used to scale the pixmap up/down to compensate for fractional scaling in at the
-    /// WM/DE level.
-    scale_factor: f64,
-    text_selection_start: Option<Vector<f32>>,
-    link_hitboxes: Vec<LinkInfo>,
-    show_link_hitboxes: bool,
-    is_over_link: bool,
-    document_outline: Vec<OutlineItem>,
 
-    doc: Document,
-    page: Page,
+    doc: mupdf::Document,
+    display_lists: Vec<mupdf::DisplayList>,
+    /// Final iced image handles cached by render key. Kept separately so iced can reuse the
+    /// GPU texture without re-uploading when the widget redraws for non-visual reasons.
+    render_cache: RefCell<HashMap<RenderKey, image::Handle>>,
+    /// Reusable MuPDF pixmaps keyed by page. These are expensive to allocate and are not Send,
+    /// so we pool them separately from the plain CPU buffers.
+    pixmap_pool: RefCell<HashMap<usize, Pixmap>>,
+    /// Plain CPU buffers returned by dropped images and shared across threads. MuPDF data is not
+    /// thread-safe, but iced may render on any thread, so we must copy into a Vec<u8> and pool
+    /// it to avoid allocating multi-megabyte buffers on every frame during zoom or pan.
+    buffer_pool: BufferPool,
 
-    old_bounds: RefCell<Rect<f32>>,
+    pub translation: Vector<f32>,
+    pub scale: f32,
+    fractional_scaling: f32,
+
+    viewport: RefCell<Size<f32>>,
+
+    mouse_pos: Vector<f32>,
+    mouse_pressed_at: Vector<f32>,
+    mouse_interaction: MouseInteraction,
+
+    selection_start: Option<Vector<f32>>,
+    selection_end: Option<Vector<f32>>,
+    selected_text: String,
+
+    layout: PageLayout,
 
     gradient_cache: [[u8; 4]; 256],
+
+    show_link_hitboxes: bool,
+    links: Vec<Vec<PageLink>>,
+    hovered_link: Option<(usize, usize)>,
+
+    outline: Vec<OutlineItem>,
+
+    /// The widget's position in window coordinates, updated each frame by the overlay draw.
+    widget_position: RefCell<iced::Point>,
 }
 
 impl PdfViewer {
+    fn build_document_data(
+        doc: &mupdf::Document,
+    ) -> Result<(
+        Vec<mupdf::DisplayList>,
+        Vec<Vec<PageLink>>,
+        Vec<OutlineItem>,
+    )> {
+        let mut display_lists = vec![];
+        let mut links = vec![];
+        for page in doc.pages()?.flatten() {
+            let dl = mupdf::DisplayList::new(page.bounds()?)?;
+            let dummy_device = Device::from_display_list(&dl)?;
+            let ctm = Matrix::IDENTITY;
+            page.run(&dummy_device, &ctm)?;
+            display_lists.push(dl);
+
+            let page_links: Vec<PageLink> = page
+                .links()?
+                .map(|link| PageLink {
+                    bounds: link.bounds,
+                    uri: link.uri,
+                    dest: link.dest,
+                })
+                .collect();
+            links.push(page_links);
+        }
+        let outline = Self::extract_outline(doc).unwrap_or_default();
+        Ok((display_lists, links, outline))
+    }
+
     pub fn from_path(path: PathBuf) -> Result<Self> {
         let name = path
             .file_name()
             .expect("The pdf must have a file name")
             .to_string_lossy()
             .to_string();
-        let doc = Document::open(&path.to_str().unwrap())?;
-        let page = doc.load_page(0)?;
-        let bounds = page.bounds()?;
-        // All of these can be immutable since the mutability is actually hidden across the ffi
-        // boundary in the C structs.
-        let list = DisplayList::new(bounds)?;
-        let list_dev = Device::from_display_list(&list)?;
-        let ctm = Matrix::IDENTITY;
-        page.run(&list_dev, &ctm)?;
-
-        let extractor = LinkExtractor::new(&page);
-        let link_hitboxes = extractor.extract_all_links()?;
-
-        let extractor = OutlineExtractor::new(&doc);
-        let document_outline = extractor.extract_outline()?;
+        let doc = mupdf::Document::open(&path.to_str().unwrap())?;
+        let (display_lists, links, outline) = Self::build_document_data(&doc)?;
 
         let bg_color = DARK_THEME
             .extended_palette()
@@ -94,320 +460,249 @@ impl PdfViewer {
         let mut gradient_cache = [[0; 4]; 256];
         generate_gradient_cache(&mut gradient_cache, &bg_color);
 
-        Ok(Self {
-            scale: 1.0,
-            scale_factor: 1.0,
+        Ok(PdfViewer {
             name,
             path,
-            label: String::new(),
-            page_progress: String::new(),
-            cur_page_idx: 0,
-            translation: Vector { x: 0.0, y: 0.0 },
-            invert_colors: CONFIG.read().unwrap().invert_pdf,
-            draw_page_borders: CONFIG.read().unwrap().page_borders,
-            inner_state: RefCell::new(inner::State {
-                bounds: Rect::default(),
-                page_size: page.bounds()?.size().into(),
-                list,
-                pix: None,
-            }),
-            last_mouse_pos: None,
-            mouse_down_pos: None,
-            panning: false,
-            text_selection_start: None,
-            link_hitboxes,
-            show_link_hitboxes: false,
-            is_over_link: false,
-            document_outline,
+            pdf_dark_mode: false,
+            interface_dark_mode: false,
+            draw_page_borders: true,
             doc,
-            page,
+            display_lists,
+            render_cache: RefCell::default(),
+            pixmap_pool: RefCell::default(),
+            buffer_pool: Arc::new(Mutex::new(HashMap::new())),
+            translation: Vector::zero(),
+            scale: 1.0,
+            fractional_scaling: 1.0,
+            viewport: RefCell::default(),
+            layout: PageLayout::SinglePage,
             gradient_cache,
-            old_bounds: RefCell::new(Rect::default()),
+            mouse_pos: Vector::zero(),
+            mouse_pressed_at: Vector::zero(),
+            mouse_interaction: MouseInteraction::None,
+            selection_start: None,
+            selection_end: None,
+            selected_text: String::new(),
+            show_link_hitboxes: false,
+            links,
+            hovered_link: None,
+            outline,
+            widget_position: RefCell::new(iced::Point::new(0.0, 0.0)),
         })
     }
 
-    pub fn update(&mut self, message: PdfMessage) -> iced::Task<PdfMessage> {
-        let task: iced::Task<PdfMessage> = match message {
-            PdfMessage::NextPage => {
-                self.set_page(self.cur_page_idx + 1).unwrap();
-                iced::Task::none()
+    pub fn update(&mut self, msg: PdfMessage) -> iced::Task<PdfMessage> {
+        let mut out = iced::Task::none();
+        let page_count = self.doc.page_count().unwrap() as usize;
+        match msg {
+            PdfMessage::PageDown => {
+                let current = self
+                    .layout
+                    .center_of_page(&self.doc, self.translation, *self.viewport.borrow())
+                    .unwrap();
+                let next = self
+                    .layout
+                    .center_of_page_below(&self.doc, self.translation, *self.viewport.borrow())
+                    .unwrap();
+
+                self.translation.y += next.center().y - current.center().y;
             }
-            PdfMessage::PreviousPage => {
-                self.set_page(self.cur_page_idx - 1).unwrap();
-                iced::Task::none()
+            PdfMessage::PageUp => {
+                let current = self
+                    .layout
+                    .center_of_page(&self.doc, self.translation, *self.viewport.borrow())
+                    .unwrap();
+                let prev = self
+                    .layout
+                    .center_of_page_above(&self.doc, self.translation, *self.viewport.borrow())
+                    .unwrap();
+
+                self.translation.y += prev.center().y - current.center().y;
             }
-            PdfMessage::SetPage(page) => {
-                self.set_page(page).unwrap();
-                iced::Task::none()
+            PdfMessage::SetPage(idx) => {
+                if idx < page_count
+                    && let Ok(translation) = self.layout.translation_for_page(
+                        &self.doc,
+                        self.scale,
+                        self.fractional_scaling,
+                        idx,
+                        *self.viewport.borrow(),
+                    )
+                {
+                    self.translation = translation;
+                }
             }
-            PdfMessage::SetTranslation(translation) => {
-                self.translation = translation;
-                iced::Task::none()
+            PdfMessage::SetTranslation(vector) => {
+                self.translation = vector;
+            }
+            PdfMessage::SetLocation(vector, scale) => {
+                self.translation = vector;
+                self.scale = scale;
+            }
+            PdfMessage::SetLayout(page_layout) => {
+                self.layout = page_layout;
             }
             PdfMessage::ZoomIn => {
                 self.scale *= 1.2;
-                iced::Task::none()
             }
             PdfMessage::ZoomOut => {
                 self.scale /= 1.2;
-                iced::Task::none()
             }
             PdfMessage::ZoomHome => {
                 self.scale = 1.0;
-                self.translation.x = 0.0;
-                self.translation.y = 0.0;
-                iced::Task::none()
             }
             PdfMessage::ZoomFit => {
-                self.scale = self.zoom_fit_ratio().unwrap_or(1.0);
-                self.translation.x = 0.0;
-                self.translation.y = 0.0;
-                iced::Task::none()
+                let page_idx = self.current_page();
+                if let Some(display_list) = self.display_lists.get(page_idx) {
+                    let page_bounds = display_list.bounds();
+                    let page_width = page_bounds.x1 - page_bounds.x0;
+                    let page_height = page_bounds.y1 - page_bounds.y0;
+                    if page_width > 0.0 && page_height > 0.0 {
+                        let viewport = *self.viewport.borrow();
+                        if viewport.width > 0.0 && viewport.height > 0.0 {
+                            let scale_x = viewport.width / page_width;
+                            let scale_y = viewport.height / page_height;
+                            self.scale = scale_x.min(scale_y) / self.fractional_scaling;
+                            if let Ok(translation) = self.layout.translation_for_page(
+                                &self.doc,
+                                self.scale,
+                                self.fractional_scaling,
+                                page_idx,
+                                viewport,
+                            ) {
+                                self.translation = translation;
+                            }
+                        }
+                    }
+                }
             }
-            PdfMessage::Move(vec) => {
-                self.translation.x += vec.x / self.scale;
-                self.translation.y += vec.y / self.scale;
-                iced::Task::none()
+            PdfMessage::Move(vector) => {
+                self.translation += vector;
             }
-            PdfMessage::UpdateBounds(rectangle) => {
-                self.inner_state.borrow_mut().bounds = rectangle;
-                iced::Task::done(PdfMessage::ReallocPixmap)
-            }
-            PdfMessage::None => iced::Task::none(),
             PdfMessage::MouseMoved(vector) => {
-                if self.inner_state.borrow().bounds.contains(vector) {
-                    if self.panning && self.last_mouse_pos.is_some() {
-                        self.translation +=
-                            (self.last_mouse_pos.unwrap() - vector).scaled(1.0 / self.scale);
+                let old_local = self.local_mouse_pos();
+                self.mouse_pos = vector;
+                let new_local = self.local_mouse_pos();
+                match self.mouse_interaction {
+                    MouseInteraction::None => {}
+                    MouseInteraction::Panning => {
+                        out = iced::Task::done(PdfMessage::Move(
+                            (old_local - new_local)
+                                .scaled(1.0 / (self.scale * self.fractional_scaling)),
+                        ))
                     }
-                    let doc_pos = self.screen_to_document_coords(vector);
-                    self.is_over_link = self
-                        .link_hitboxes
-                        .iter()
-                        .any(|link| link.bounds.contains(doc_pos));
-
-                    self.last_mouse_pos = Some(vector);
+                    MouseInteraction::Selecting => {
+                        self.selection_end = Some(new_local);
+                    }
+                }
+                self.update_hovered_link();
+            }
+            PdfMessage::MouseAction(mouse_action, pressed) => {
+                if pressed {
+                    match mouse_action {
+                        MouseAction::Panning => {
+                            self.mouse_interaction = MouseInteraction::Panning;
+                            self.mouse_pressed_at = self.mouse_pos;
+                            self.selection_start = None;
+                            self.selection_end = None;
+                        }
+                        MouseAction::Selection => {
+                            self.mouse_interaction = MouseInteraction::Selecting;
+                            self.mouse_pressed_at = self.mouse_pos;
+                            let local = self.local_mouse_pos();
+                            self.selection_start = Some(local);
+                            self.selection_end = Some(local);
+                            self.selected_text.clear();
+                        }
+                        MouseAction::NextPage => {
+                            out = iced::Task::done(PdfMessage::PageDown);
+                        }
+                        MouseAction::PreviousPage => {
+                            out = iced::Task::done(PdfMessage::PageUp);
+                        }
+                        MouseAction::ZoomIn => {
+                            out = iced::Task::done(PdfMessage::ZoomIn);
+                        }
+                        MouseAction::ZoomOut => {
+                            out = iced::Task::done(PdfMessage::ZoomOut);
+                        }
+                        MouseAction::MoveUp => {
+                            out = iced::Task::done(PdfMessage::Move(Vector::new(0.0, -MOVE_STEP)));
+                        }
+                        MouseAction::MoveDown => {
+                            out = iced::Task::done(PdfMessage::Move(Vector::new(0.0, MOVE_STEP)));
+                        }
+                        MouseAction::MoveLeft => {
+                            out = iced::Task::done(PdfMessage::Move(Vector::new(-MOVE_STEP, 0.0)));
+                        }
+                        MouseAction::MoveRight => {
+                            out = iced::Task::done(PdfMessage::Move(Vector::new(MOVE_STEP, 0.0)));
+                        }
+                    }
                 } else {
-                    self.last_mouse_pos = None;
-                    self.is_over_link = false;
-                }
-                iced::Task::none()
-            }
-            PdfMessage::MouseLeftDown(shift_pressed) => {
-                // Store the initial mouse position for click vs pan detection
-                self.mouse_down_pos = self.last_mouse_pos;
-
-                if shift_pressed {
-                    // Start text selection at mouse position
-                    if let Some(pos) = self.last_mouse_pos {
-                        self.text_selection_start = Some(pos);
-                    }
-                } else {
-                    // Don't start panning if we're close enough to the edge that a pane resizing might happen
-                    if let Some(mp) = self.last_mouse_pos {
-                        let mut padded_bounds = self.inner_state.borrow().bounds;
-                        padded_bounds.x0 += Vector { x: 11.0, y: 11.0 };
-                        padded_bounds.x1 -= Vector { x: 11.0, y: 11.0 };
-                        if padded_bounds.contains(mp) {
-                            self.panning = true;
-                        }
-                    }
-                }
-                iced::Task::none()
-            }
-            PdfMessage::MouseLeftUp(shift_pressed) => {
-                if !shift_pressed {
-                    // Handle link clicks only if mouse didn't move significantly (click vs pan)
-                    let is_click = if let (Some(down_pos), Some(up_pos)) =
-                        (self.mouse_down_pos, self.last_mouse_pos)
-                    {
-                        let delta = up_pos - down_pos;
-                        let distance = (delta.x * delta.x + delta.y * delta.y).sqrt();
-                        distance < MIN_CLICK_DISTANCE
-                    } else {
-                        false
-                    };
-
-                    if is_click
-                        && let Some(pos) = self
-                            .last_mouse_pos
-                            .map(|p| self.screen_to_document_coords(p))
-                        && let Some(link) = self
-                            .link_hitboxes
-                            .iter()
-                            .find(|link| link.bounds.contains(pos))
-                    {
-                        match link.link_type {
-                            LinkType::InternalPage(page) => {
-                                if self.set_page(page as i32).is_err() {
-                                    error!("Couldn't jump to page {page}");
-                                }
-                            }
-                            LinkType::ExternalUrl => {
-                                if let Err(e) = open::that(&link.uri) {
-                                    error!("Failed to open external link: {}", e);
-                                    // Fallback to clipboard copy if opening fails
-                                    if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                        && let Err(e) = clipboard.set_text(&link.uri)
-                                    {
-                                        error!("Failed to copy link to clipboard: {}", e);
-                                    }
-                                }
-                            }
-                            LinkType::Email | LinkType::Other => {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                    && let Err(e) = clipboard.set_text(&link.uri)
-                                {
-                                    error!("Failed to copy link to clipboard: {}", e);
-                                }
-                            }
-                        }
-                        // Hide links after activation
-                        self.show_link_hitboxes = false;
-                    }
-                    self.panning = false;
-                    self.mouse_down_pos = None;
-                }
-                iced::Task::none()
-            }
-            PdfMessage::MouseAction(action, pressed) => {
-                match (action, pressed) {
-                    (MouseAction::Panning, true) => {
-                        if let Some(mp) = self.last_mouse_pos {
-                            let mut padded_bounds = self.inner_state.borrow().bounds;
-                            padded_bounds.x0 += Vector { x: 11.0, y: 11.0 };
-                            padded_bounds.x1 -= Vector { x: 11.0, y: 11.0 };
-                            if padded_bounds.contains(mp) {
-                                self.panning = true;
-                            }
-                        }
-                    }
-                    (MouseAction::Panning, false) => {
-                        self.panning = false;
-                    }
-                    (MouseAction::Selection, true) => {
-                        if let Some(pos) = self.last_mouse_pos {
-                            self.text_selection_start = Some(pos);
-                        }
-                    }
-                    (MouseAction::Selection, false) => {
-                        if let (Some(start_pos), Some(end_pos)) =
-                            (self.text_selection_start, self.last_mouse_pos)
-                        {
-                            let doc_start = self.screen_to_document_coords(start_pos);
-                            let doc_end = self.screen_to_document_coords(end_pos);
-
-                            let selection_rect = Rect::from_points(
-                                Vector::new(doc_start.x.min(doc_end.x), doc_start.y.min(doc_end.y)),
-                                Vector::new(doc_start.x.max(doc_end.x), doc_start.y.max(doc_end.y)),
-                            );
-
-                            if selection_rect.width() > MIN_SELECTION
-                                && selection_rect.height() > MIN_SELECTION
+                    match self.mouse_interaction {
+                        MouseInteraction::None | MouseInteraction::Panning => {
+                            let dist_sq = (self.mouse_pos - self.mouse_pressed_at).norm_squared();
+                            if dist_sq < MIN_CLICK_DISTANCE * MIN_CLICK_DISTANCE
+                                && let Some((page_idx, link_idx)) = self.hovered_link
                             {
-                                let extractor = TextExtractor::new(&self.page);
-                                let selection = extractor
-                                    .extract_text_in_rect(selection_rect.into())
-                                    .unwrap();
-                                info!("Copied: \"{}\" at {:?}", selection.text, selection.bounds);
-                                arboard::Clipboard::new().map_or_else(
-                                    |e| error!("{e}"),
-                                    |mut clipboard| {
-                                        clipboard
-                                            .set_text(selection.text)
-                                            .inspect_err(|e| error!("{e}"))
-                                            .unwrap();
-                                    },
-                                )
+                                out = self.activate_link(page_idx, link_idx);
                             }
                         }
-                        self.text_selection_start = None;
+                        MouseInteraction::Selecting => {
+                            if let (Some(start), Some(end)) =
+                                (self.selection_start, self.selection_end)
+                            {
+                                let min = Vector::new(start.x.min(end.x), start.y.min(end.y));
+                                let max = Vector::new(start.x.max(end.x), start.y.max(end.y));
+                                if (max - min).norm_squared() >= MIN_SELECTION * MIN_SELECTION {
+                                    let selection_rect = Rect::from_points(min, max);
+                                    self.selected_text =
+                                        self.extract_text_from_rect(selection_rect);
+                                    debug!("Selected text: {}", self.selected_text);
+                                } else {
+                                    self.selection_start = None;
+                                    self.selection_end = None;
+                                }
+                            }
+                        }
                     }
-                    (MouseAction::NextPage, true) => {
-                        let _ = self.set_page(self.cur_page_idx + 1);
-                    }
-                    (MouseAction::NextPage, false) => {}
-                    (MouseAction::PreviousPage, true) => {
-                        let _ = self.set_page(self.cur_page_idx - 1);
-                    }
-                    (MouseAction::PreviousPage, false) => {}
-                    (MouseAction::ZoomIn, true) => {
-                        self.scale *= 1.2;
-                    }
-                    (MouseAction::ZoomIn, false) => {}
-                    (MouseAction::ZoomOut, true) => {
-                        self.scale /= 1.2;
-                    }
-                    (MouseAction::ZoomOut, false) => {}
-                    (MouseAction::MoveUp, true) => {
-                        self.translation.y -= crate::config::MOVE_STEP / self.scale;
-                    }
-                    (MouseAction::MoveUp, false) => {}
-                    (MouseAction::MoveDown, true) => {
-                        self.translation.y += crate::config::MOVE_STEP / self.scale;
-                    }
-                    (MouseAction::MoveDown, false) => {}
-                    (MouseAction::MoveLeft, true) => {
-                        self.translation.x -= crate::config::MOVE_STEP / self.scale;
-                    }
-                    (MouseAction::MoveLeft, false) => {}
-                    (MouseAction::MoveRight, true) => {
-                        self.translation.x += crate::config::MOVE_STEP / self.scale;
-                    }
-                    (MouseAction::MoveRight, false) => {}
+                    self.mouse_interaction = MouseInteraction::None;
                 }
-                iced::Task::none()
             }
             PdfMessage::ToggleLinkHitboxes => {
                 self.show_link_hitboxes = !self.show_link_hitboxes;
-                iced::Task::none()
             }
-            PdfMessage::ActivateLink(index) => {
-                if let Some(link) = self.link_hitboxes.get(index) {
-                    match link.link_type {
-                        LinkType::InternalPage(page) => {
-                            if self.set_page(page as i32).is_err() {
-                                error!("Couldn't jump to page {page}");
-                            }
-                        }
-                        LinkType::ExternalUrl => {
-                            if let Err(e) = open::that(&link.uri) {
-                                error!("Failed to open external link: {}", e);
-                                if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                    && let Err(e) = clipboard.set_text(&link.uri)
-                                {
-                                    error!("Failed to copy link to clipboard: {}", e);
-                                }
-                            }
-                        }
-                        LinkType::Email | LinkType::Other => {
-                            if let Ok(mut clipboard) = arboard::Clipboard::new()
-                                && let Err(e) = clipboard.set_text(&link.uri)
-                            {
-                                error!("Failed to copy link to clipboard: {}", e);
-                            }
-                        }
-                    }
-                    // Hide links after activation
-                    self.show_link_hitboxes = false;
+            PdfMessage::ActivateLink(idx) => {
+                let viewport = *self.viewport.borrow();
+                let visible = self.visible_links(viewport);
+                if let Some(((page_idx, link_idx), _)) = visible.get(idx) {
+                    out = self.activate_link(*page_idx, *link_idx);
                 }
-                iced::Task::none()
             }
             PdfMessage::CloseLinkHitboxes => {
                 self.show_link_hitboxes = false;
-                iced::Task::none()
             }
             PdfMessage::FileChanged => {
-                self.refresh_file().unwrap();
-                iced::Task::none()
-            }
-            PdfMessage::ReallocPixmap => {
-                self.inner_state.borrow_mut().pix = None;
-                iced::Task::none()
+                self.render_cache.borrow_mut().clear();
+                self.pixmap_pool.borrow_mut().clear();
+
+                if let Some(path_str) = self.path.to_str() {
+                    if let Ok(new_doc) = mupdf::Document::open(path_str) {
+                        if let Ok((display_lists, links, outline)) =
+                            Self::build_document_data(&new_doc)
+                        {
+                            self.doc = new_doc;
+                            self.display_lists = display_lists;
+                            self.links = links;
+                            self.outline = outline;
+                        }
+                    }
+                }
             }
             PdfMessage::PrintPdf => {
                 let path = self.path.clone();
-                iced::Task::perform(
+                out = iced::Task::perform(
                     async move {
                         let file_url = format!("file://{}", path.to_string_lossy());
                         if let Err(e) = webbrowser::open(&file_url) {
@@ -415,28 +710,426 @@ impl PdfViewer {
                         }
                     },
                     |_| PdfMessage::None,
-                )
+                );
             }
-        };
-        self.label = format!(
-            "{} {}/{}",
-            self.name,
-            self.cur_page_idx + 1,
-            self.doc.page_count().unwrap_or(0),
-        );
-        self.page_progress = format!(
-            " {}/{}",
-            self.cur_page_idx + 1,
-            self.doc.page_count().unwrap_or(0),
-        );
-        task
+            PdfMessage::None => {}
+        }
+        out
     }
 
-    pub fn is_jumpable_action(&self, message: &PdfMessage) -> bool {
-        match message {
+    pub fn view(&self) -> iced::Element<'_, PdfMessage> {
+        let pages = widget::responsive(|size| {
+            {
+                let mut viewport = self.viewport.borrow_mut();
+                *viewport = size;
+            }
+            let rects = self
+                .layout
+                .pages_rects(
+                    self.doc.pages().unwrap(),
+                    self.translation.scaled(-1.0),
+                    self.scale,
+                    self.fractional_scaling,
+                    size,
+                )
+                .unwrap();
+            let viewport_rect =
+                Rect::from_pos_size(Vector::zero(), Vector::new(size.width, size.height));
+
+            let effective_scale = self.scale * self.fractional_scaling;
+
+            // Drop pixmap allocations for pages that are no longer visible.
+            let visible_indices: Vec<usize> = rects
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| viewport_rect.intersects(r))
+                .map(|(i, _)| i)
+                .collect();
+            self.pixmap_pool
+                .borrow_mut()
+                .retain(|idx, _| visible_indices.contains(idx));
+
+            let with_handles: Vec<_> = rects
+                .into_iter()
+                .zip(self.doc.pages().unwrap())
+                .enumerate()
+                .filter(|(_, (r, _page))| viewport_rect.intersects(r))
+                .map(|(i, (rect_ss, page))| {
+                    // rect_ss = A pages bounding box in screen coordinates (relative to the widgets origin)
+                    let page = page.unwrap();
+                    let page_bounds: Rect<f32> = page.bounds().unwrap().into();
+
+                    let fully_visible = rect_ss.x0.x >= 0.0
+                        && rect_ss.x1.x <= viewport_rect.x1.x
+                        && rect_ss.x0.y >= 0.0
+                        && rect_ss.x1.y <= viewport_rect.x1.y;
+
+                    let (key, draw_rect, w, h, matrix, scissor) = if fully_visible {
+                        let key = RenderKey::Full(i, effective_scale.to_bits());
+                        let w = rect_ss.width().ceil().max(1.0) as i32;
+                        let h = rect_ss.height().ceil().max(1.0) as i32;
+                        let tx = -page_bounds.x0.x * effective_scale;
+                        let ty = -page_bounds.x0.y * effective_scale;
+                        let matrix =
+                            Matrix::new(effective_scale, 0.0, 0.0, effective_scale, tx, ty);
+                        let scissor = mupdf::Rect::new(0.0, 0.0, w as f32, h as f32);
+                        (key, rect_ss, w, h, matrix, scissor)
+                    } else {
+                        let vis = rect_ss.intersect(&viewport_rect);
+                        let vw = vis.width().ceil().max(1.0) as i32;
+                        let vh = vis.height().ceil().max(1.0) as i32;
+
+                        let render_offset_x = rect_ss.x0.x - vis.x0.x;
+                        let render_offset_y = rect_ss.x0.y - vis.x0.y;
+
+                        // During a smooth pan the translation changes by sub-pixel amounts every
+                        // frame. Using raw floats as a cache key would force a full re-render on
+                        // every mouse event because the key would differ each time. We snap the
+                        // offset to whole pixels so the cached image survives small pans, and
+                        // compensate the draw rectangle by the rounding error so the visual
+                        // position stays accurate without paying the render cost.
+                        let snapped_offset_x = render_offset_x.round();
+                        let snapped_offset_y = render_offset_y.round();
+
+                        let key = RenderKey::Partial(
+                            i,
+                            effective_scale.to_bits(),
+                            snapped_offset_x as i32,
+                            snapped_offset_y as i32,
+                            vw,
+                            vh,
+                        );
+
+                        let raster_tx = snapped_offset_x - page_bounds.x0.x * effective_scale;
+                        let raster_ty = snapped_offset_y - page_bounds.x0.y * effective_scale;
+                        let matrix = Matrix::new(
+                            effective_scale,
+                            0.0,
+                            0.0,
+                            effective_scale,
+                            raster_tx,
+                            raster_ty,
+                        );
+                        let scissor = mupdf::Rect::new(0.0, 0.0, vw as f32, vh as f32);
+
+                        // Compensate for snapping so the image is drawn at the
+                        // correct sub-pixel position. draw_x = r.x0.x - snapped_offset_x
+                        // which is the rounding error in [-0.5, 0.5].
+                        let draw_rect = Rect::from_pos_size(
+                            Vector::new(
+                                rect_ss.x0.x - snapped_offset_x,
+                                rect_ss.x0.y - snapped_offset_y,
+                            ),
+                            Vector::new(vw as f32, vh as f32),
+                        );
+
+                        (key, draw_rect, vw, vh, matrix, scissor)
+                    };
+
+                    let mut cache = self.render_cache.borrow_mut();
+                    let handle = cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            let _span = tracy_client::span!("Pdf cache miss");
+
+                            // Try to reuse a pixmap allocation for this page.
+                            let mut pool = self.pixmap_pool.borrow_mut();
+                            let mut pix = pool.remove(&i).unwrap_or_else(|| {
+                                Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true).unwrap()
+                            });
+
+                            // If the pooled pixmap has the wrong size, allocate a new one.
+                            if pix.width() as i32 != w || pix.height() as i32 != h {
+                                let _span = tracy_client::span!("Pixmap bounds mismatch");
+                                pix = Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true)
+                                    .unwrap();
+                            }
+
+                            // MuPDF only overwrites pixels actually touched by page content.
+                            // Margins or transparent regions would keep stale data from the
+                            // previous pool user (or be uninitialized). Filling with white
+                            // guarantees the paper background that PDFs assume.
+                            pix.samples_mut().fill(255);
+                            let device = Device::from_pixmap(&pix).unwrap();
+                            self.display_lists[i]
+                                .run(&device, &matrix, scissor)
+                                .unwrap();
+
+                            if self.pdf_dark_mode {
+                                cpu_pdf_dark_mode_shader(&mut pix, &self.gradient_cache);
+                            }
+
+                            let samples = pix.samples();
+
+                            // NOTE: We have to copy the data at least once since the mupdf structures
+                            // NOTE: and their associated data aren't thread safe. Iced could render
+                            // NOTE: them on any thread without my control
+
+                            // Try to reuse a CPU buffer from the shared pool.
+                            let mut buf = self
+                                .buffer_pool
+                                .lock()
+                                .unwrap()
+                                .remove(&i)
+                                .and_then(|mut v| v.pop())
+                                .unwrap_or_else(|| Vec::with_capacity(samples.len()));
+                            buf.clear();
+                            buf.extend_from_slice(samples);
+                            // Return the mupdf pixmap to the pool for reuse.
+                            pool.insert(i, pix);
+
+                            image::Handle::from_rgba(
+                                w as u32,
+                                h as u32,
+                                image::Bytes::from_owner(PooledBuffer {
+                                    buf: Some(buf),
+                                    pool: Arc::downgrade(&self.buffer_pool),
+                                    page_idx: i,
+                                }),
+                            )
+                        })
+                        .clone();
+                    (handle, draw_rect)
+                })
+                .collect();
+
+            widget::canvas(Document::new(
+                with_handles,
+                self.draw_page_borders,
+                self.pdf_dark_mode,
+            ))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
+        });
+
+        let selection_overlay = widget::canvas(SelectionOverlay::new(self))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill);
+
+        let link_overlay = widget::canvas(LinkOverlay::new(self))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill);
+
+        // We need the stack here because an image being drawn inside a canvas appears on top of
+        // shapes regardless of draw order. This way we force the draw order to allow for
+        // shapes to overlay images.
+        widget::Stack::with_children([pages.into(), selection_overlay.into(), link_overlay.into()])
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
+    }
+
+    pub fn extract_text_from_rect(&self, screen_rect: Rect<f32>) -> String {
+        use mupdf::TextPageFlags;
+
+        let effective_scale = self.scale * self.fractional_scaling;
+        let viewport = *self.viewport.borrow();
+
+        let Ok(pages) = self.doc.pages() else {
+            return String::new();
+        };
+        let Ok(rects) = self.layout.pages_rects(
+            pages,
+            self.translation.scaled(-1.0),
+            self.scale,
+            self.fractional_scaling,
+            viewport,
+        ) else {
+            return String::new();
+        };
+
+        let mut result = String::new();
+
+        for (i, page_rect) in rects.iter().enumerate() {
+            let intersect = screen_rect.intersect(page_rect);
+            if intersect.width() <= 0.0 || intersect.height() <= 0.0 {
+                continue;
+            }
+
+            let page_bounds = self.display_lists[i].bounds();
+
+            let pdf_rect = mupdf::Rect::new(
+                (intersect.x0.x - page_rect.x0.x) / effective_scale + page_bounds.x0,
+                (intersect.x0.y - page_rect.x0.y) / effective_scale + page_bounds.y0,
+                (intersect.x1.x - page_rect.x0.x) / effective_scale + page_bounds.x0,
+                (intersect.x1.y - page_rect.x0.y) / effective_scale + page_bounds.y0,
+            );
+
+            let Ok(text_page) = self.display_lists[i].to_text_page(TextPageFlags::empty()) else {
+                continue;
+            };
+
+            for block in text_page.blocks() {
+                for line in block.lines() {
+                    let line_bounds = line.bounds();
+                    if !rectangles_intersect(pdf_rect, line_bounds) {
+                        continue;
+                    }
+                    for ch in line.chars() {
+                        let quad = ch.quad();
+                        let char_rect =
+                            mupdf::Rect::new(quad.ul.x, quad.ul.y, quad.lr.x, quad.lr.y);
+                        if rectangles_intersect(pdf_rect, char_rect)
+                            && let Some(c) = ch.char()
+                        {
+                            result.push(c);
+                        }
+                    }
+                    result.push('\n');
+                }
+            }
+        }
+
+        result.trim().to_string()
+    }
+
+    pub fn selected_text(&self) -> &str {
+        &self.selected_text
+    }
+
+    fn selection_rect(&self) -> Option<Rect<f32>> {
+        let (start, end) = (self.selection_start?, self.selection_end?);
+        Some(Rect::from_points(
+            Vector::new(start.x.min(end.x), start.y.min(end.y)),
+            Vector::new(start.x.max(end.x), start.y.max(end.y)),
+        ))
+    }
+
+    fn visible_links(&self, viewport: iced::Size<f32>) -> Vec<((usize, usize), Rect<f32>)> {
+        let mut result = Vec::new();
+        let Ok(pages) = self.doc.pages() else {
+            return result;
+        };
+        let Ok(page_rects) = self.layout.pages_rects(
+            pages,
+            self.translation.scaled(-1.0),
+            self.scale,
+            self.fractional_scaling,
+            viewport,
+        ) else {
+            return result;
+        };
+
+        let viewport_rect = Rect::from_pos_size(Vector::zero(), viewport.into());
+
+        for (page_idx, page_rect) in page_rects.iter().enumerate() {
+            if !viewport_rect.intersects(page_rect) {
+                continue;
+            }
+            let page_bounds = self.display_lists[page_idx].bounds();
+            let page_width = page_bounds.x1 - page_bounds.x0;
+            let page_height = page_bounds.y1 - page_bounds.y0;
+            if page_width <= 0.0 || page_height <= 0.0 {
+                continue;
+            }
+            let scale_x = page_rect.width() / page_width;
+            let scale_y = page_rect.height() / page_height;
+
+            for (link_idx, link) in self.links[page_idx].iter().enumerate() {
+                let screen_rect = Rect::from_points(
+                    Vector::new(
+                        page_rect.x0.x + (link.bounds.x0 - page_bounds.x0) * scale_x,
+                        page_rect.x0.y + (link.bounds.y0 - page_bounds.y0) * scale_y,
+                    ),
+                    Vector::new(
+                        page_rect.x0.x + (link.bounds.x1 - page_bounds.x0) * scale_x,
+                        page_rect.x0.y + (link.bounds.y1 - page_bounds.y0) * scale_y,
+                    ),
+                );
+                if viewport_rect.intersects(&screen_rect) {
+                    result.push(((page_idx, link_idx), screen_rect));
+                }
+            }
+        }
+        result
+    }
+
+    fn local_mouse_pos(&self) -> Vector<f32> {
+        let offset: Vector<f32> = (*self.widget_position.borrow()).into();
+        self.mouse_pos - offset
+    }
+
+    fn update_hovered_link(&mut self) {
+        let local_mouse = self.local_mouse_pos();
+        let viewport = *self.viewport.borrow();
+        let visible = self.visible_links(viewport);
+        self.hovered_link = visible
+            .iter()
+            .find(|(_, rect)| rect.contains(local_mouse))
+            .map(|((page_idx, link_idx), _)| (*page_idx, *link_idx));
+    }
+
+    fn activate_link(&mut self, page_idx: usize, link_idx: usize) -> iced::Task<PdfMessage> {
+        let Some(link) = self.links.get(page_idx).and_then(|p| p.get(link_idx)) else {
+            return iced::Task::none();
+        };
+
+        self.show_link_hitboxes = false;
+
+        if link.uri.starts_with("http://")
+            || link.uri.starts_with("https://")
+            || link.uri.starts_with("mailto:")
+        {
+            let _ = open::that(&link.uri);
+        } else if let Some(dest) = link.dest {
+            let page_num = dest.loc.page_number as usize;
+            if page_num < self.doc.page_count().unwrap() as usize {
+                return iced::Task::done(PdfMessage::SetPage(page_num));
+            }
+        } else if link.uri.starts_with("#page=")
+            && let Some(page_str) = link.uri.strip_prefix("#page=")
+            && let Ok(page_num) = page_str.parse::<usize>()
+        {
+            if page_num > 0 {
+                return iced::Task::done(PdfMessage::SetPage(page_num - 1));
+            }
+        } else if link.uri.chars().all(|c| c.is_ascii_digit())
+            && let Ok(page_num) = link.uri.parse::<usize>()
+            && page_num > 0
+        {
+            return iced::Task::done(PdfMessage::SetPage(page_num - 1));
+        }
+
+        iced::Task::none()
+    }
+
+    pub fn page_count(&self) -> Result<i32> {
+        Ok(self.doc.page_count()?)
+    }
+
+    #[cfg(test)]
+    pub fn set_viewport_for_test(&mut self, size: iced::Size) {
+        *self.viewport.borrow_mut() = size;
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        self.fractional_scaling = scale_factor as f32;
+    }
+
+    pub fn set_pdf_dark_mode(&mut self, dark_mode_enabled: bool) {
+        if self.pdf_dark_mode != dark_mode_enabled {
+            self.pdf_dark_mode = dark_mode_enabled;
+            self.render_cache.borrow_mut().clear();
+        }
+    }
+
+    pub fn set_interface_dark_mode(&mut self, dark_mode_enabled: bool) {
+        if self.interface_dark_mode != dark_mode_enabled {
+            self.interface_dark_mode = dark_mode_enabled;
+            self.render_cache.borrow_mut().clear();
+        }
+    }
+
+    pub fn is_jumpable_action(&self, msg: &PdfMessage) -> bool {
+        match msg {
             PdfMessage::ActivateLink(index) => {
-                if let Some(link) = self.link_hitboxes.get(*index) {
-                    matches!(link.link_type, LinkType::InternalPage(_))
+                if let Some(link) = self
+                    .links
+                    .get(self.current_page())
+                    .and_then(|p| p.get(*index))
+                {
+                    link.uri.starts_with("#page=")
                 } else {
                     false
                 }
@@ -445,156 +1138,42 @@ impl PdfViewer {
         }
     }
 
-    pub fn view(&self) -> iced::Element<'_, PdfMessage> {
-        self.draw_pdf_to_pixmap().unwrap();
-        PageViewer::new(self.inner_state.borrow())
-            .translation(self.translation)
-            .scale(self.scale)
-            .invert_colors(self.invert_colors)
-            .draw_page_borders(self.draw_page_borders)
-            .text_selection(self.current_selection_rect())
-            .link_hitboxes(if self.show_link_hitboxes {
-                Some(&self.link_hitboxes)
-            } else {
-                None
-            })
-            .over_link(self.is_over_link)
-            .into()
-    }
-
-    fn set_page(&mut self, idx: i32) -> Result<()> {
-        self.cur_page_idx = idx.clamp(0, self.doc.page_count()? - 1);
-        self.page = self.doc.load_page(self.cur_page_idx)?;
-        let bounds = self.page.bounds()?;
-
-        let mut state = self.inner_state.borrow_mut();
-
-        state.page_size = bounds.size().into();
-        // Regenerate DisplayList for the new page
-        state.list = DisplayList::new(bounds)?;
-        let list_dev = Device::from_display_list(&state.list)?;
-        let ctm = Matrix::IDENTITY;
-        self.page.run(&list_dev, &ctm)?;
-
-        let extractor = LinkExtractor::new(&self.page);
-        self.link_hitboxes = extractor.extract_all_links()?;
-
-        Ok(())
-    }
-
-    pub fn refresh_file(&mut self) -> Result<()> {
-        self.doc = Document::open(&self.path.to_str().unwrap())?;
-        let extractor = OutlineExtractor::new(&self.doc);
-        self.document_outline = extractor.extract_outline()?;
-        self.set_page(self.cur_page_idx)?;
-        Ok(())
-    }
-
-    fn page_size(&self) -> Vector<f32> {
-        let page_bounds: geometry::Rect<f32> = self.page.bounds().unwrap().into();
-        page_bounds.size()
-    }
-
-    fn zoom_fit_ratio(&mut self) -> Result<f32> {
-        let vertical_scale = self.inner_state.borrow().bounds.height() / self.page_size().y;
-        let horizontal_scale = self.inner_state.borrow().bounds.width() / self.page_size().x;
-        Ok(vertical_scale.min(horizontal_scale))
-    }
-
-    fn screen_to_document_coords(&self, mut screen_pos: Vector<f32>) -> Vector<f32> {
-        let centering_vector = (self.inner_state.borrow().bounds.size()
-            - self.page_size().scaled(self.scale))
-        .scaled(0.5);
-        screen_pos -= self.inner_state.borrow().bounds.x0; // screen scale
-        screen_pos -= centering_vector; // screen scale
-        screen_pos.scale(1.0 / self.scale);
-        screen_pos += self.translation;
-        screen_pos
-    }
-
     pub fn get_outline(&self) -> &[OutlineItem] {
-        self.document_outline.as_slice()
+        &self.outline
     }
 
-    pub fn get_page_count(&self) -> i32 {
-        self.doc.page_count().unwrap_or(0)
+    fn extract_outline(doc: &mupdf::Document) -> Result<Vec<OutlineItem>> {
+        let outlines = doc.outlines()?;
+        let mut items = Vec::new();
+        for outline in &outlines {
+            items.push(Self::convert_outline(outline, 0)?);
+        }
+        Ok(items)
     }
 
-    pub fn set_scale_factor(&mut self, scale_factor: f64) {
-        if (self.scale_factor - scale_factor).abs() > 0.01 {
-            self.scale_factor = scale_factor;
-            // Invalidate pixmap to force re-render at new scale factor
-            self.inner_state.borrow_mut().pix = None;
+    fn convert_outline(outline: &mupdf::Outline, level: u32) -> Result<OutlineItem> {
+        let mut children = Vec::new();
+        for child in &outline.down {
+            children.push(Self::convert_outline(child, level + 1)?);
         }
+        Ok(OutlineItem {
+            title: outline.title.clone(),
+            page: outline.dest.map(|d| d.loc.page_number),
+            level,
+            children,
+        })
     }
 
-    fn current_selection_rect(&self) -> Option<Rect<f32>> {
-        if let (Some(start_pos), Some(current_pos)) =
-            (self.text_selection_start, self.last_mouse_pos)
-        {
-            let top_left = Vector::new(
-                start_pos.x.min(current_pos.x),
-                start_pos.y.min(current_pos.y),
-            );
-            let bottom_right = Vector::new(
-                start_pos.x.max(current_pos.x),
-                start_pos.y.max(current_pos.y),
-            );
-            Some(Rect::from_points(top_left, bottom_right))
-        } else {
-            None
-        }
+    pub fn page_progress(&self) -> String {
+        let current = self.current_page() + 1;
+        let total = self.page_count().unwrap_or(0);
+        format!("({} / {})", current, total)
     }
 
-    fn draw_pdf_to_pixmap(&self) -> Result<()> {
-        let mut state = self.inner_state.borrow_mut();
-        let mut ctm = Matrix::IDENTITY;
-
-        let effective_scale = self.scale * self.scale_factor as f32;
-        let centering_vector = (state.bounds.size().scaled(self.scale_factor as f32)
-            - self.page_size().scaled(effective_scale))
-        .scaled(0.5);
-        ctm.pre_translate(centering_vector.x, centering_vector.y);
-
-        ctm.scale(effective_scale, effective_scale);
-        ctm.pre_translate(-self.translation.x, -self.translation.y);
-
-        let mut old_bounds = self.old_bounds.borrow_mut();
-        // The bounds check here saves one frame of jitter on resizing the window for some reason
-        if *old_bounds != state.bounds || state.pix.is_none() {
-            let render_width = (state.bounds.width() * self.scale_factor as f32).round() as i32;
-            let render_height = (state.bounds.height() * self.scale_factor as f32).round() as i32;
-
-            state.pix = Some(
-                Pixmap::new_with_w_h(&Colorspace::device_rgb(), render_width, render_height, true)
-                    .unwrap(),
-            );
-
-            *old_bounds = state.bounds;
-        }
-        let bounds = state.bounds;
-        let device = {
-            let pix = state.pix.as_mut().unwrap();
-            let samples = pix.samples_mut();
-            samples.fill(255);
-            Device::from_pixmap(pix)?
-        };
-        state.list.run(
-            &device,
-            &ctm,
-            mupdf::Rect {
-                x0: 0.0,
-                y0: 0.0,
-                x1: bounds.width() * self.scale_factor as f32,
-                y1: bounds.height() * self.scale_factor as f32,
-            },
-        )?;
-        let pix = state.pix.as_mut().unwrap();
-        if self.invert_colors {
-            cpu_pdf_dark_mode_shader(pix, &self.gradient_cache);
-        }
-
-        Ok(())
+    pub fn current_page(&self) -> usize {
+        self.layout
+            .current_page_index(&self.doc, self.translation, *self.viewport.borrow())
+            .unwrap()
     }
 }
 
@@ -611,7 +1190,9 @@ fn generate_gradient_cache(cache: &mut [[u8; 4]; 256], bg_color: &[u8; 4]) {
     }
 }
 
-fn cpu_pdf_dark_mode_shader(pixmap: &mut Pixmap, gradient_cache: &[[u8; 4]; 256]) {
+fn cpu_pdf_dark_mode_shader(pixmap: &mut mupdf::Pixmap, gradient_cache: &[[u8; 4]; 256]) {
+    // PERF: Slow in debug builds but more than fast enough in release builds.
+    let _span = tracy_client::span!("Cpu dark mode shader");
     let samples = pixmap.samples_mut();
     for pixel in samples.chunks_exact_mut(4) {
         let r: u16 = pixel[0] as u16;
@@ -620,5 +1201,146 @@ fn cpu_pdf_dark_mode_shader(pixmap: &mut Pixmap, gradient_cache: &[[u8; 4]; 256]
         let brightness = ((r + g + b) / 3) as usize;
         let pixel_array: &mut [u8; 4] = pixel.try_into().unwrap();
         *pixel_array = gradient_cache[brightness];
+    }
+}
+
+fn rectangles_intersect(a: mupdf::Rect, b: mupdf::Rect) -> bool {
+    a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0
+}
+
+fn generate_key_combinations(count: usize) -> Vec<String> {
+    // Use easily distinguishable characters (excluding confusing ones like 'I', 'l', 'O', '0')
+    const CHARS: &[char] = &[
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm', 'n', 'p', 'q', 'r', 's', 't', 'u',
+        'v', 'w', 'x', 'y', 'z',
+    ];
+
+    let mut keys = Vec::new();
+
+    for &c in CHARS.iter().take(count.min(CHARS.len())) {
+        keys.push(c.to_string());
+    }
+
+    if count > CHARS.len() {
+        let remaining = count - CHARS.len();
+        let mut added = 0;
+        'outer: for &c1 in CHARS {
+            for &c2 in CHARS {
+                if added >= remaining {
+                    break 'outer;
+                }
+                keys.push(format!("{}{}", c1, c2));
+                added += 1;
+            }
+        }
+    }
+
+    keys
+}
+
+/// Returns the pdf background color
+fn get_pdf_background_color(pdf_dark_mode: bool, show_borders: bool) -> iced::Color {
+    if show_borders {
+        if pdf_dark_mode {
+            iced::Color::from_rgb8(21, 22, 32)
+        } else {
+            iced::Color::from_rgb8(220, 219, 218)
+        }
+    } else {
+        if pdf_dark_mode {
+            DARK_THEME.palette().background
+        } else {
+            iced::Color::WHITE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use super::*;
+
+    #[test]
+    fn test_zoom_fit_scales_current_page_to_viewport() -> Result<()> {
+        let mut viewer = PdfViewer::from_path(PathBuf::from("assets/links.pdf"))?;
+        let viewport = iced::Size::new(800.0, 600.0);
+        viewer.set_viewport_for_test(viewport);
+        viewer.layout = PageLayout::SinglePage;
+
+        // Start on page 0
+        let start_page = viewer.current_page();
+        assert_eq!(start_page, 0);
+
+        let _ = viewer.update(PdfMessage::ZoomFit);
+
+        let page_idx = viewer.current_page();
+        assert_eq!(
+            page_idx, start_page,
+            "ZoomFit should keep the same current page"
+        );
+
+        let page_bounds = viewer.display_lists[page_idx].bounds();
+        let page_width = page_bounds.x1 - page_bounds.x0;
+        let page_height = page_bounds.y1 - page_bounds.y0;
+
+        let effective_scale = viewer.scale * viewer.fractional_scaling;
+        let scaled_width = page_width * effective_scale;
+        let scaled_height = page_height * effective_scale;
+
+        assert!(
+            scaled_width <= viewport.width + 1e-3,
+            "Scaled width {} should fit in viewport width {}",
+            scaled_width,
+            viewport.width
+        );
+        assert!(
+            scaled_height <= viewport.height + 1e-3,
+            "Scaled height {} should fit in viewport height {}",
+            scaled_height,
+            viewport.height
+        );
+
+        // The scale should be the largest scale that still fits the page.
+        let scale_x = viewport.width / page_width;
+        let scale_y = viewport.height / page_height;
+        let expected_scale = scale_x.min(scale_y) / viewer.fractional_scaling;
+        assert!(
+            (viewer.scale - expected_scale).abs() < 1e-3,
+            "Expected scale ~{}, got {}",
+            expected_scale,
+            viewer.scale
+        );
+
+        // Verify the page is fully visible by checking its rect.
+        let rects = viewer.layout.pages_rects(
+            viewer.doc.pages()?,
+            -viewer.translation,
+            viewer.scale,
+            viewer.fractional_scaling,
+            viewport,
+        )?;
+        let page_rect = rects[page_idx];
+        assert!(
+            page_rect.x0.x >= -1e-3,
+            "Page left edge {} should be inside viewport",
+            page_rect.x0.x
+        );
+        assert!(
+            page_rect.x1.x <= viewport.width + 1e-3,
+            "Page right edge {} should be inside viewport",
+            page_rect.x1.x
+        );
+        assert!(
+            page_rect.x0.y >= -1e-3,
+            "Page top edge {} should be inside viewport",
+            page_rect.x0.y
+        );
+        assert!(
+            page_rect.x1.y <= viewport.height + 1e-3,
+            "Page bottom edge {} should be inside viewport",
+            page_rect.x1.y
+        );
+
+        Ok(())
     }
 }

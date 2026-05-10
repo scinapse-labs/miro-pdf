@@ -1,37 +1,37 @@
 use crate::{
-    geometry::{Rect, Vector},
     config::MouseAction,
+    geometry::{Vector},
+    pdf::page_layout::PageLayout,
 };
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
 
-mod inner;
-pub mod link_extraction;
-pub mod outline_extraction;
-pub mod text_extraction;
+pub mod page_layout;
 pub mod widget;
 
 #[derive(Debug, Clone, Serialize, Deserialize, EnumString, Default)]
 pub enum PdfMessage {
-    NextPage,
-    PreviousPage,
-    SetPage(i32),
+    PageDown,
+    PageUp,
+    SetPage(usize),
     SetTranslation(Vector<f32>),
+    /// Translation and scale
+    SetLocation(Vector<f32>, f32),
+    SetLayout(PageLayout),
     ZoomIn,
     ZoomOut,
     ZoomHome,
     ZoomFit,
     Move(Vector<f32>),
-    UpdateBounds(Rect<f32>),
     MouseMoved(Vector<f32>),
-    MouseLeftDown(bool),            // bool indicates if Shift is pressed
-    MouseLeftUp(bool),              // bool indicates if Shift is pressed
-    MouseAction(MouseAction, bool), // action and whether it's pressed (true) or released (false)
+    /// A [MouseAction] and whether it's pressed (true) or released (false)
+    MouseAction(MouseAction, bool),
     ToggleLinkHitboxes,
-    ActivateLink(usize), // Activate link by index
-    CloseLinkHitboxes,   // Close/hide link hitboxes
+    /// Activate link by index
+    ActivateLink(usize),
+    /// Close/hide link hitboxes
+    CloseLinkHitboxes,
     FileChanged,
-    ReallocPixmap,
     PrintPdf,
     #[default]
     None,

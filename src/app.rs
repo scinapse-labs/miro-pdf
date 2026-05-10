@@ -1,4 +1,7 @@
-use std::{fs::canonicalize, path::PathBuf};
+use std::{
+    fs::canonicalize,
+    path::{PathBuf},
+};
 
 use iced::{
     advanced::graphics::core::window,
@@ -32,16 +35,20 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::{
+    CONFIG,
     bookmarks::{BookmarkMessage, BookmarkStore},
     config::{BindableMessage, MouseAction, MouseButton, MouseInput, MouseModifiers},
     geometry::Vector,
     icons,
     jumplist::{JumpLocation, Jumplist},
-    pdf::{outline_extraction::OutlineItem, widget::PdfViewer, PdfMessage},
+    pdf::{
+        PdfMessage,
+        page_layout::PageLayout,
+        widget::{OutlineItem, PdfViewer},
+    },
     recent_files::RecentFiles,
     rpc::rpc_server,
-    watch::{file_watcher, WatchMessage, WatchNotification},
-    CONFIG,
+    watch::{WatchMessage, WatchNotification, file_watcher},
 };
 
 #[derive(Debug)]
@@ -103,16 +110,12 @@ pub enum AppMessage {
     ToggleDarkModePdf,
     TogglePageBorders,
     MouseMoved(Vector<f32>),
-    MouseLeftDown,
-    MouseRightDown,
-    MouseMiddleDown,
-    MouseBackDown,
-    MouseForwardDown,
-    MouseLeftUp,
-    MouseRightUp,
-    MouseMiddleUp,
-    MouseBackUp,
-    MouseForwardUp,
+    #[strum(disabled)]
+    #[serde(skip)]
+    MouseButtonDown(MouseButton),
+    #[strum(disabled)]
+    #[serde(skip)]
+    MouseButtonUp(MouseButton),
     ShiftPressed(bool),
     CtrlPressed(bool),
     #[strum(disabled)]
@@ -127,7 +130,7 @@ pub enum AppMessage {
     PaneResize(pane_grid::ResizeEvent),
     ToggleSidebar,
     SetSidebar(SidebarTab),
-    OutlineGoToPage(u32),
+    OutlineGoToPage(usize),
     Exit,
     #[default]
     None,
@@ -217,6 +220,7 @@ impl App {
     }
 
     pub fn update(&mut self, message: AppMessage) -> iced::Task<AppMessage> {
+        let _span = tracy_client::span!("App update");
         match message {
             AppMessage::OpenFile(path_buf) => {
                 let path_buf = canonicalize(path_buf).unwrap();
@@ -224,6 +228,7 @@ impl App {
                 let out = match PdfViewer::from_path(path_buf.clone()) {
                     Ok(mut viewer) => {
                         viewer.set_scale_factor(self.scale_factor);
+                        viewer.set_pdf_dark_mode(self.invert_pdf);
                         self.pdfs.push(viewer);
                         iced::Task::done(AppMessage::OpenTab(self.pdfs.len() - 1))
                     }
@@ -337,12 +342,15 @@ impl App {
             }
             AppMessage::ToggleDarkModeUi => {
                 self.dark_mode = !self.dark_mode;
+                for pdf in &mut self.pdfs {
+                    pdf.set_interface_dark_mode(self.invert_pdf);
+                }
                 iced::Task::none()
             }
             AppMessage::ToggleDarkModePdf => {
                 self.invert_pdf = !self.invert_pdf;
                 for pdf in &mut self.pdfs {
-                    pdf.invert_colors = self.invert_pdf;
+                    pdf.set_pdf_dark_mode(self.invert_pdf);
                 }
                 iced::Task::none()
             }
@@ -356,87 +364,34 @@ impl App {
             AppMessage::None => iced::Task::none(),
             AppMessage::MouseMoved(vector) => {
                 if !self.pdfs.is_empty() {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseMoved(vector));
+                    self.pdfs[self.pdf_idx]
+                        .update(PdfMessage::MouseMoved(vector))
+                        .map(AppMessage::PdfMessage)
+                } else {
+                    iced::Task::none()
                 }
-                iced::Task::none()
             }
-            AppMessage::MouseLeftDown => {
-                if !self.pdfs.is_empty() {
-                    let _ = self.pdfs[self.pdf_idx]
-                        .update(PdfMessage::MouseLeftDown(self.shift_pressed));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseRightDown => {
+            AppMessage::MouseButtonDown(button) => {
                 if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Right)
+                    && let Some(action) = self.get_mouse_action(button)
                 {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, true));
+                    self.pdfs[self.pdf_idx]
+                        .update(PdfMessage::MouseAction(action, true))
+                        .map(AppMessage::PdfMessage)
+                } else {
+                    iced::Task::none()
                 }
-                iced::Task::none()
             }
-            AppMessage::MouseMiddleDown => {
+            AppMessage::MouseButtonUp(button) => {
                 if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Middle)
+                    && let Some(action) = self.get_mouse_action(button)
                 {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, true));
+                    self.pdfs[self.pdf_idx]
+                        .update(PdfMessage::MouseAction(action, false))
+                        .map(AppMessage::PdfMessage)
+                } else {
+                    iced::Task::none()
                 }
-                iced::Task::none()
-            }
-            AppMessage::MouseLeftUp => {
-                if !self.pdfs.is_empty() {
-                    let _ =
-                        self.pdfs[self.pdf_idx].update(PdfMessage::MouseLeftUp(self.shift_pressed));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseRightUp => {
-                if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Right)
-                {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, false));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseMiddleUp => {
-                if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Middle)
-                {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, false));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseBackDown => {
-                if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Back)
-                {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, true));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseBackUp => {
-                if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Back)
-                {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, false));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseForwardDown => {
-                if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Forward)
-                {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, true));
-                }
-                iced::Task::none()
-            }
-            AppMessage::MouseForwardUp => {
-                if !self.pdfs.is_empty()
-                    && let Some(action) = self.get_mouse_action(MouseButton::Forward)
-                {
-                    let _ = self.pdfs[self.pdf_idx].update(PdfMessage::MouseAction(action, false));
-                }
-                iced::Task::none()
             }
             AppMessage::ShiftPressed(pressed) => {
                 self.shift_pressed = pressed;
@@ -453,7 +408,7 @@ impl App {
             }
             AppMessage::BookmarkMessage(BookmarkMessage::RequestNewBookmark { name }) => {
                 let path = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.path.clone());
-                let page = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.cur_page_idx);
+                let page = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.current_page());
                 if let (Some(path), Some(page)) = (path, page) {
                     self.bookmark_store
                         .update(BookmarkMessage::CreateBookmark { path, name, page })
@@ -505,7 +460,7 @@ impl App {
                 if !self.pdfs.is_empty() {
                     self.record_location();
                     let pdf_msg = self.pdfs[self.pdf_idx]
-                        .update(PdfMessage::SetPage(page as i32))
+                        .update(PdfMessage::SetPage(page))
                         .map(AppMessage::PdfMessage);
                     self.record_location();
                     pdf_msg
@@ -526,26 +481,30 @@ impl App {
                                 return iced::Task::none();
                             };
                             if let Some(action) = self.get_mouse_action(button) {
-                                let _ = self.pdfs[self.pdf_idx]
-                                    .update(PdfMessage::MouseAction(action, true));
+                                self.pdfs[self.pdf_idx]
+                                    .update(PdfMessage::MouseAction(action, true))
+                                    .map(AppMessage::PdfMessage)
+                            } else {
+                                iced::Task::none()
                             }
                         }
                         iced::mouse::ScrollDelta::Pixels { x, y } => {
                             let sensitivity = CONFIG.read().unwrap().trackpad_sensitivity;
                             let move_vec = Vector::new(-x * sensitivity, y * sensitivity);
-                            let _ = self.pdfs[self.pdf_idx].update(PdfMessage::Move(move_vec));
+                            self.pdfs[self.pdf_idx]
+                                .update(PdfMessage::Move(move_vec))
+                                .map(AppMessage::PdfMessage)
                         }
                     }
+                } else {
+                    iced::Task::none()
                 }
-                iced::Task::none()
             }
             AppMessage::Exit => exit(),
             AppMessage::FoundWindowId(id) => match id {
                 Some(id) => get_scale_factor(id)
                     .map(AppMessage::FoundScaleFactor)
-                    .chain(iced::Task::done(AppMessage::PdfMessage(
-                        PdfMessage::ReallocPixmap,
-                    ))),
+                    .chain(iced::Task::none()),
                 None => iced::Task::none(),
             },
             AppMessage::FoundScaleFactor(scale) => {
@@ -564,12 +523,11 @@ impl App {
                 {
                     Some((i, pdf)) => {
                         self.pdf_idx = i;
-                        pdf.update(PdfMessage::SetPage(location.page))
-                            .map(AppMessage::PdfMessage)
-                            .chain(
-                                pdf.update(PdfMessage::SetTranslation(location.translation))
-                                    .map(AppMessage::PdfMessage),
-                            )
+                        pdf.update(PdfMessage::SetLocation(
+                            location.translation,
+                            location.scale,
+                        ))
+                        .map(AppMessage::PdfMessage)
                     }
                     None => iced::Task::done(AppMessage::OpenFile(location.pdf_path.clone()))
                         .chain(iced::Task::done(AppMessage::JumpTo(location))),
@@ -599,14 +557,14 @@ impl App {
         if let Some(pdf) = self.pdfs.get(self.pdf_idx) {
             self.jumplist.push(JumpLocation {
                 pdf_path: pdf.path.clone(),
-                page: pdf.cur_page_idx,
                 translation: pdf.translation,
+                scale: pdf.scale,
             })
         };
     }
 
     fn create_menu_bar(&self) -> Element<'_, AppMessage> {
-        let menu_tpl_1 = |items| Menu::new(items).max_width(205.0).offset(0.0).spacing(0.0);
+        let menu_tpl_1 = |items| Menu::new(items).max_width(300.0).offset(0.0).spacing(0.0);
         let cfg = CONFIG.read().unwrap();
 
         let exit_close_label = if self.pdfs.is_empty() {
@@ -636,7 +594,7 @@ impl App {
                 AppMessage::OpenNewFileFinder,
                 cfg.get_binding_for_msg(BindableMessage::OpenFileFinder)
             ))(menu_separator())(menu_label("Recent"))(
-                create_recent_file_button(&recent_files[0])
+                create_recent_file_button(recent_files[0].clone())
             )(menu_separator())(menu_button(
                 "Print",
                 AppMessage::PdfMessage(PdfMessage::PrintPdf),
@@ -651,10 +609,10 @@ impl App {
                 AppMessage::OpenNewFileFinder,
                 cfg.get_binding_for_msg(BindableMessage::OpenFileFinder)
             ))(menu_separator())(menu_label("Recent"))(
-                create_recent_file_button(&recent_files[0])
-            )(create_recent_file_button(&recent_files[1]))(
-                menu_separator()
-            )(menu_button(
+                create_recent_file_button(recent_files[0].clone())
+            )(create_recent_file_button(
+                recent_files[1].clone()
+            ))(menu_separator())(menu_button(
                 "Print",
                 AppMessage::PdfMessage(PdfMessage::PrintPdf),
                 cfg.get_binding_for_msg(BindableMessage::PrintPdf)
@@ -668,10 +626,12 @@ impl App {
                 AppMessage::OpenNewFileFinder,
                 cfg.get_binding_for_msg(BindableMessage::OpenFileFinder)
             ))(menu_separator())(menu_label("Recent"))(
-                create_recent_file_button(&recent_files[0])
-            )(create_recent_file_button(&recent_files[1]))(
-                create_recent_file_button(&recent_files[2])
-            )(menu_separator())(menu_button(
+                create_recent_file_button(recent_files[0].clone())
+            )(create_recent_file_button(
+                recent_files[1].clone()
+            ))(create_recent_file_button(
+                recent_files[2].clone()
+            ))(menu_separator())(menu_button(
                 "Print",
                 AppMessage::PdfMessage(PdfMessage::PrintPdf),
                 cfg.get_binding_for_msg(BindableMessage::PrintPdf)
@@ -685,12 +645,14 @@ impl App {
                 AppMessage::OpenNewFileFinder,
                 cfg.get_binding_for_msg(BindableMessage::OpenFileFinder)
             ))(menu_separator())(menu_label("Recent"))(
-                create_recent_file_button(&recent_files[0])
-            )(create_recent_file_button(&recent_files[1]))(
-                create_recent_file_button(&recent_files[2])
-            )(create_recent_file_button(&recent_files[3]))(
-                menu_separator()
-            )(menu_button(
+                create_recent_file_button(recent_files[0].clone())
+            )(create_recent_file_button(
+                recent_files[1].clone()
+            ))(create_recent_file_button(
+                recent_files[2].clone()
+            ))(create_recent_file_button(
+                recent_files[3].clone()
+            ))(menu_separator())(menu_button(
                 "Print",
                 AppMessage::PdfMessage(PdfMessage::PrintPdf),
                 cfg.get_binding_for_msg(BindableMessage::PrintPdf)
@@ -704,12 +666,16 @@ impl App {
                 AppMessage::OpenNewFileFinder,
                 cfg.get_binding_for_msg(BindableMessage::OpenFileFinder)
             ))(menu_separator())(menu_label("Recent"))(
-                create_recent_file_button(&recent_files[0])
-            )(create_recent_file_button(&recent_files[1]))(
-                create_recent_file_button(&recent_files[2])
-            )(create_recent_file_button(&recent_files[3]))(
-                create_recent_file_button(&recent_files[4])
-            )(menu_separator())(menu_button(
+                create_recent_file_button(recent_files[0].clone())
+            )(create_recent_file_button(
+                recent_files[1].clone()
+            ))(create_recent_file_button(
+                recent_files[2].clone()
+            ))(create_recent_file_button(
+                recent_files[3].clone()
+            ))(create_recent_file_button(
+                recent_files[4].clone()
+            ))(menu_separator())(menu_button(
                 "Print",
                 AppMessage::PdfMessage(PdfMessage::PrintPdf),
                 cfg.get_binding_for_msg(BindableMessage::PrintPdf)
@@ -780,6 +746,25 @@ impl App {
                     AppMessage::ToggleFullscreen,
                     cfg.get_binding_for_msg(BindableMessage::ToggleFullscreen)
                 ))))
+            )(
+                debug_button_s("Layout"),
+                menu_tpl_1(menu_items!((menu_button(
+                    "Single page",
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::SinglePage)),
+                    cfg.get_binding_for_msg(BindableMessage::SinglePageLayout)
+                ))(menu_button(
+                    "Double page",
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::DoublePage)),
+                    cfg.get_binding_for_msg(BindableMessage::DoublePageLayout)
+                ))(menu_button(
+                    "Double page with title page",
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::DoublePageTitlePage)),
+                    cfg.get_binding_for_msg(BindableMessage::DoublePageTitlePageLayout)
+                ))(menu_button(
+                    "Presentation",
+                    AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::Presentation)),
+                    cfg.get_binding_for_msg(BindableMessage::PresentationLayout)
+                ))))
             ))
             .draw_path(menu::DrawPath::Backdrop)
             .style(
@@ -827,7 +812,7 @@ impl App {
         for (i, pdf) in self.pdfs.iter().enumerate() {
             command_bar = command_bar.push(file_tab(
                 &pdf.name,
-                &pdf.page_progress,
+                pdf.page_progress(),
                 AppMessage::OpenTab(i),
                 AppMessage::CloseTab(i),
                 i == self.pdf_idx,
@@ -847,7 +832,7 @@ impl App {
                 PaneType::Sidebar => self.view_sidebar(),
                 PaneType::Pdf => {
                     let menu_bar = self.create_menu_bar();
-                    let pdf_content = if self.pdfs.is_empty() {
+                    let pdf_content: iced::Element<'_, AppMessage> = if self.pdfs.is_empty() {
                         vertical_space().into()
                     } else {
                         self.pdfs[self.pdf_idx].view().map(AppMessage::PdfMessage)
@@ -1133,22 +1118,12 @@ impl App {
                 iced::mouse::Event::CursorMoved { position } => {
                     Some(AppMessage::MouseMoved(position.into()))
                 }
-                iced::mouse::Event::ButtonPressed(button) => match button {
-                    iced::mouse::Button::Left => Some(AppMessage::MouseLeftDown),
-                    iced::mouse::Button::Right => Some(AppMessage::MouseRightDown),
-                    iced::mouse::Button::Middle => Some(AppMessage::MouseMiddleDown),
-                    iced::mouse::Button::Back => Some(AppMessage::MouseBackDown),
-                    iced::mouse::Button::Forward => Some(AppMessage::MouseForwardDown),
-                    iced::mouse::Button::Other(_) => None,
-                },
-                iced::mouse::Event::ButtonReleased(button) => match button {
-                    iced::mouse::Button::Left => Some(AppMessage::MouseLeftUp),
-                    iced::mouse::Button::Right => Some(AppMessage::MouseRightUp),
-                    iced::mouse::Button::Middle => Some(AppMessage::MouseMiddleUp),
-                    iced::mouse::Button::Back => Some(AppMessage::MouseBackUp),
-                    iced::mouse::Button::Forward => Some(AppMessage::MouseForwardUp),
-                    _ => None,
-                },
+                iced::mouse::Event::ButtonPressed(button) => {
+                    iced_to_config_mouse_button(button).map(AppMessage::MouseButtonDown)
+                }
+                iced::mouse::Event::ButtonReleased(button) => {
+                    iced_to_config_mouse_button(button).map(AppMessage::MouseButtonUp)
+                }
                 iced::mouse::Event::WheelScrolled { delta } => match status {
                     iced::event::Status::Ignored => match delta {
                         iced::mouse::ScrollDelta::Lines { x: _, y: _ } => {
@@ -1165,16 +1140,8 @@ impl App {
             _ => None,
         });
 
-        let resizes = listen_with(|event, _, _| match event {
-            Event::Window(window::Event::Resized(_)) => {
-                Some(AppMessage::PdfMessage(PdfMessage::ReallocPixmap))
-            }
-            _ => None,
-        });
-
         let mut subs = vec![
             keys,
-            resizes,
             Subscription::run(file_watcher).map(AppMessage::FileWatcher),
         ];
 
@@ -1227,7 +1194,7 @@ fn view_outline_items<'a>(items: &'a [OutlineItem], level: u32) -> widget::Colum
                 ..Default::default()
             })
             .width(Length::Fill)
-            .on_press(AppMessage::OutlineGoToPage(page))
+            .on_press(AppMessage::OutlineGoToPage(page as usize))
         } else {
             button(
                 container(text(&item.title).shaping(text::Shaping::Advanced).style(
@@ -1310,14 +1277,13 @@ fn format_key_sequence(seq: &KeySeq) -> String {
     out
 }
 
-fn create_recent_file_button(
-    path: &PathBuf,
-) -> button::Button<'_, AppMessage, iced::Theme, iced::Renderer> {
+fn create_recent_file_button<'a>(
+    path: PathBuf,
+) -> button::Button<'a, AppMessage, iced::Theme, iced::Renderer> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string_lossy().to_string());
-    let path_clone = path.clone();
     base_button(
         row![
             text(file_name),
@@ -1329,7 +1295,7 @@ fn create_recent_file_button(
                 }
             })
         ],
-        AppMessage::OpenFile(path_clone),
+        AppMessage::OpenFile(path),
     )
     .width(Length::Fill)
     .style(move |theme, status| {
@@ -1478,7 +1444,7 @@ fn menu_button_last(
 
 fn file_tab<'a>(
     file_name: &'a str,
-    page_progress: &'a str,
+    page_progress: String,
     on_press: AppMessage,
     on_close: AppMessage,
     is_open: bool,
@@ -1582,4 +1548,15 @@ fn toggle_fullscreen() -> iced::Task<AppMessage> {
             window::Mode::Fullscreen => iced::window::change_mode(id, window::Mode::Windowed),
             _ => iced::window::change_mode(id, window::Mode::Fullscreen),
         })
+}
+
+fn iced_to_config_mouse_button(button: iced::mouse::Button) -> Option<MouseButton> {
+    match button {
+        iced::mouse::Button::Left => Some(MouseButton::Left),
+        iced::mouse::Button::Right => Some(MouseButton::Right),
+        iced::mouse::Button::Middle => Some(MouseButton::Middle),
+        iced::mouse::Button::Back => Some(MouseButton::Back),
+        iced::mouse::Button::Forward => Some(MouseButton::Forward),
+        iced::mouse::Button::Other(_) => None,
+    }
 }

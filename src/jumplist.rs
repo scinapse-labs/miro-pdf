@@ -6,16 +6,22 @@ use std::{collections::VecDeque, path::PathBuf};
 const LOCATION_TOLERANCE_PX: f32 = 5.0;
 const JUMPLIST_CAPACITY: usize = 100;
 
+// FIX: We cant just use translation and scale since they are layout dependent. Translation, scale
+// and a page number isn't well defined either unfortunately since there can be many pages on screen
+// at once.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct JumpLocation {
     pub pdf_path: PathBuf,
-    pub page: i32,
     pub translation: Vector<f32>,
+    pub scale: f32,
 }
 
 impl JumpLocation {
     pub fn approx_equal(&self, other: &Self) -> bool {
-        if self.pdf_path != other.pdf_path || self.page != other.page {
+        if self.pdf_path != other.pdf_path
+            || (self.translation - other.translation).norm_squared() > 1e-3
+            || (self.scale - other.scale).abs() > 1e-3
+        {
             return false;
         }
 
