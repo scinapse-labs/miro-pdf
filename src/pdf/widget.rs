@@ -169,15 +169,6 @@ impl<'a> widget::canvas::Program<PdfMessage> for SelectionOverlay<'a> {
         };
 
         let viewport = bounds.size();
-        let Ok(_) = self.viewer.layout.pages_rects(
-            &self.viewer.doc,
-            self.viewer.translation.scaled(-1.0),
-            self.viewer.scale,
-            self.viewer.fractional_scaling,
-            viewport,
-        ) else {
-            return Vec::new();
-        };
 
         let mut frame = canvas::Frame::new(renderer, viewport);
 
@@ -697,7 +688,7 @@ impl PdfViewer {
             let rects = self
                 .layout
                 .pages_rects(
-                    &self.doc,
+                    self.doc.pages().unwrap(),
                     self.translation.scaled(-1.0),
                     self.scale,
                     self.fractional_scaling,
@@ -886,8 +877,11 @@ impl PdfViewer {
         let effective_scale = self.scale * self.fractional_scaling;
         let viewport = *self.viewport.borrow();
 
+        let Ok(pages) = self.doc.pages() else {
+            return String::new();
+        };
         let Ok(rects) = self.layout.pages_rects(
-            &self.doc,
+            pages,
             self.translation.scaled(-1.0),
             self.scale,
             self.fractional_scaling,
@@ -955,8 +949,11 @@ impl PdfViewer {
 
     fn visible_links(&self, viewport: iced::Size<f32>) -> Vec<((usize, usize), Rect<f32>)> {
         let mut result = Vec::new();
+        let Ok(pages) = self.doc.pages() else {
+            return result;
+        };
         let Ok(page_rects) = self.layout.pages_rects(
-            &self.doc,
+            pages,
             self.translation.scaled(-1.0),
             self.scale,
             self.fractional_scaling,
@@ -1237,7 +1234,7 @@ mod tests {
 
         // Verify the page is fully visible by checking its rect.
         let rects = viewer.layout.pages_rects(
-            &viewer.doc,
+            viewer.doc.pages()?,
             -viewer.translation,
             viewer.scale,
             viewer.fractional_scaling,
