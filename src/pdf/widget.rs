@@ -1108,9 +1108,10 @@ impl PdfViewer {
         })
     }
 
-    pub fn page_progress(&self) -> &str {
-        // TODO: Implement
-        "(? / ?)"
+    pub fn page_progress(&self) -> String {
+        let current = self.current_page() + 1;
+        let total = self.page_count().unwrap_or(0);
+        format!("({} / {})", current, total)
     }
 
     pub fn current_page(&self) -> usize {

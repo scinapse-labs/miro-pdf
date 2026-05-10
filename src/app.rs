@@ -1443,7 +1443,7 @@ fn menu_button_last(
 
 fn file_tab<'a>(
     file_name: &'a str,
-    page_progress: &'a str,
+    page_progress: String,
     on_press: AppMessage,
     on_close: AppMessage,
     is_open: bool,
