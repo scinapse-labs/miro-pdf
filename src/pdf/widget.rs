@@ -122,11 +122,11 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
 
     fn draw(
         &self,
-        state: &Self::State,
+        _state: &Self::State,
         renderer: &Renderer,
-        theme: &iced::Theme,
+        _theme: &iced::Theme,
         bounds: iced::Rectangle,
-        cursor: iced::advanced::mouse::Cursor,
+        _cursor: iced::advanced::mouse::Cursor,
     ) -> Vec<canvas::Geometry<Renderer>> {
         let _span = tracy_client::span!("Pdf draw");
         let bg = self.cache.draw(renderer, bounds.size(), |frame| {
@@ -137,13 +137,6 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
                 let bounds: iced::Rectangle = (*rect).into();
                 frame.draw_image(bounds, handle);
             }
-
-            let bounds_size = Vector::new(bounds.size().width, bounds.size().height).scaled(0.5);
-            frame.fill_rectangle(
-                (bounds_size - Vector::new(2.0, 2.0)).into(),
-                iced::Size::new(4.0, 4.0),
-                iced::Color::from_rgb(1.0, 0.0, 0.0),
-            );
         });
         vec![bg]
     }
@@ -176,7 +169,7 @@ impl<'a> widget::canvas::Program<PdfMessage> for SelectionOverlay<'a> {
         };
 
         let viewport = bounds.size();
-        let Ok(page_rects) = self.viewer.layout.pages_rects(
+        let Ok(_) = self.viewer.layout.pages_rects(
             &self.viewer.doc,
             self.viewer.translation.scaled(-1.0),
             self.viewer.scale,
@@ -806,7 +799,6 @@ impl PdfViewer {
                             cpu_pdf_dark_mode_shader(&mut pix, &self.gradient_cache);
                         }
 
-                        // TODO: This is NOT zero-copy. Can we make it?
                         let samples = pix.samples();
 
                         // NOTE: We have to copy the data at least once since the mupdf structures
@@ -1097,6 +1089,12 @@ impl PdfViewer {
     pub fn page_progress(&self) -> &str {
         // TODO: Implement
         "(? / ?)"
+    }
+
+    pub fn current_page(&self) -> usize {
+        self.layout
+            .current_page_index(&self.doc, self.translation, *self.viewport.borrow())
+            .unwrap()
     }
 }
 

@@ -404,17 +404,15 @@ impl App {
                 iced::Task::none()
             }
             AppMessage::BookmarkMessage(BookmarkMessage::RequestNewBookmark { name }) => {
-                // TODO: Which page should become the bookmark? Multiple can be on the screen
-                // let path = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.path.clone());
-                // let page = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.cur_page_idx);
-                // if let (Some(path), Some(page)) = (path, page) {
-                //     self.bookmark_store
-                //         .update(BookmarkMessage::CreateBookmark { path, name, page })
-                //         .map(AppMessage::BookmarkMessage)
-                // } else {
-                //     iced::Task::none()
-                // }
-                iced::Task::none()
+                let path = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.path.clone());
+                let page = self.pdfs.get(self.pdf_idx).map(|pdf| pdf.current_page());
+                if let (Some(path), Some(page)) = (path, page) {
+                    self.bookmark_store
+                        .update(BookmarkMessage::CreateBookmark { path, name, page })
+                        .map(AppMessage::BookmarkMessage)
+                } else {
+                    iced::Task::none()
+                }
             }
             AppMessage::BookmarkMessage(BookmarkMessage::GoTo { path, page }) => {
                 if let Some(pdf_index) = self.pdfs.iter().position(|pdf| pdf.path == path) {
