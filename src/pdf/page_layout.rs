@@ -55,7 +55,7 @@ impl PageLayout {
                     pos.y += Self::GAP * effective_scale;
                     prev_bounds = bounds;
 
-                    out.push(bounds.into());
+                    out.push(bounds);
                 }
             }
             PageLayout::DoublePage => {
@@ -76,7 +76,7 @@ impl PageLayout {
                         pos.x += Self::GAP * effective_scale;
                     }
 
-                    out.push(bounds.into());
+                    out.push(bounds);
                 }
 
                 if out.len() >= 2 {
@@ -96,7 +96,7 @@ impl PageLayout {
                 bounds.translate((vsize - bounds.size()).scaled(0.5));
                 bounds.translate(translation.scaled(effective_scale));
                 bounds = bounds.scaled(effective_scale);
-                out.push(bounds.into());
+                out.push(bounds);
                 pos.y += Self::GAP * effective_scale + bounds.size().y;
 
                 for (i, page) in pages.flatten().enumerate() {
@@ -115,7 +115,7 @@ impl PageLayout {
                         pos.x += Self::GAP * effective_scale;
                     }
 
-                    out.push(bounds.into());
+                    out.push(bounds);
                 }
 
                 if out.len() >= 3 {
@@ -147,11 +147,11 @@ impl PageLayout {
                     pos.y += Self::GAP * effective_scale;
                     prev_bounds = bounds;
 
-                    out.push(bounds.into());
+                    out.push(bounds);
                 }
 
                 if !out.is_empty() {
-                    let viewport_center: Vector<f32> = vsize.scaled(0.5).into();
+                    let viewport_center = vsize.scaled(0.5);
                     let closest = out
                         .iter()
                         .enumerate()
@@ -184,7 +184,13 @@ impl PageLayout {
         page_idx: usize,
         viewport: Size<f32>,
     ) -> Result<Vector<f32>> {
-        let rects = self.pages_rects(doc.pages()?, Vector::zero(), scale, fractional_scale, viewport)?;
+        let rects = self.pages_rects(
+            doc.pages()?,
+            Vector::zero(),
+            scale,
+            fractional_scale,
+            viewport,
+        )?;
         let rect = rects
             .get(page_idx)
             .ok_or(anyhow!("Page index {page_idx} out of bounds"))?;
@@ -211,7 +217,7 @@ impl PageLayout {
                 closest = i;
             }
         }
-        return Ok(closest);
+        Ok(closest)
     }
 
     pub fn center_of_page(
@@ -287,14 +293,26 @@ mod tests {
 
         // Page 0 should need minimal/no translation to be centered
         // (it's already centered when translation=0)
-        assert!(t0.norm_squared() < 1.0, "Page 0 should be near viewport center with zero translation, got {:?}", t0);
+        assert!(
+            t0.norm_squared() < 1.0,
+            "Page 0 should be near viewport center with zero translation, got {:?}",
+            t0
+        );
 
         // Page 1 is below the viewport center, so we need positive y translation
         // (self.translation is negated before being passed to pages_rects in view())
-        assert!(t1.y > t0.y, "Page 1 should require positive y translation, got {:?}", t1);
+        assert!(
+            t1.y > t0.y,
+            "Page 1 should require positive y translation, got {:?}",
+            t1
+        );
 
         // Page 2 is even further down
-        assert!(t2.y > t1.y, "Page 2 should require more positive y translation than page 1, got {:?}", t2);
+        assert!(
+            t2.y > t1.y,
+            "Page 2 should require more positive y translation than page 1, got {:?}",
+            t2
+        );
 
         // Verify that applying the NEGATED translation to pages_rects centers the page
         // (view() passes -self.translation to pages_rects)
@@ -302,7 +320,12 @@ mod tests {
         let viewport_center = Vector::new(viewport.width, viewport.height).scaled(0.5);
         let page1_center = rects[1].center();
         let diff = (page1_center - viewport_center).norm_squared();
-        assert!(diff < 1.0, "Page 1 should be centered after applying -translation, got center {:?}, viewport center {:?}", page1_center, viewport_center);
+        assert!(
+            diff < 1.0,
+            "Page 1 should be centered after applying -translation, got center {:?}, viewport center {:?}",
+            page1_center,
+            viewport_center
+        );
 
         Ok(())
     }

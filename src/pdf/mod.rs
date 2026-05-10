@@ -1,6 +1,6 @@
 use crate::{
     config::MouseAction,
-    geometry::{Rect, Vector},
+    geometry::{Vector},
     pdf::page_layout::PageLayout,
 };
 use serde::{Deserialize, Serialize};

@@ -9,7 +9,7 @@ use anyhow::Result;
 use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
 use iced::{
     Renderer, Size,
-    advanced::{Renderer as _, graphics::geometry, image},
+    advanced::{graphics::geometry, image},
     widget::{
         self,
         canvas::{self, Cache, Stroke},
@@ -61,12 +61,11 @@ impl AsRef<[u8]> for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        if let Some(buf) = self.buf.take() {
-            if let Some(pool) = self.pool.upgrade() {
-                if let Ok(mut pool) = pool.lock() {
-                    pool.entry(self.page_idx).or_default().push(buf);
-                }
-            }
+        if let Some(buf) = self.buf.take()
+            && let Some(pool) = self.pool.upgrade()
+            && let Ok(mut pool) = pool.lock()
+        {
+            pool.entry(self.page_idx).or_default().push(buf);
         }
     }
 }
@@ -117,7 +116,7 @@ impl Document {
     }
 }
 
-impl<'a> widget::canvas::Program<PdfMessage> for Document {
+impl widget::canvas::Program<PdfMessage> for Document {
     type State = ();
 
     fn draw(
@@ -278,15 +277,14 @@ impl<'a> widget::canvas::Program<PdfMessage> for LinkOverlay<'a> {
 
         let mut frame = canvas::Frame::new(renderer, viewport);
 
-        if let Some((page_idx, link_idx)) = self.viewer.hovered_link {
-            if let Some((_, rect)) = visible
+        if let Some((page_idx, link_idx)) = self.viewer.hovered_link
+            && let Some((_, rect)) = visible
                 .iter()
                 .find(|((p, l), _)| *p == page_idx && *l == link_idx)
-            {
-                let mut color = iced::Color::from_rgb(0.0, 0.4, 0.8);
-                color.a = 0.15;
-                frame.fill_rectangle(rect.x0.into(), rect.size().into(), color);
-            }
+        {
+            let mut color = iced::Color::from_rgb(0.0, 0.4, 0.8);
+            color.a = 0.15;
+            frame.fill_rectangle(rect.x0.into(), rect.size().into(), color);
         }
 
         if self.viewer.show_link_hitboxes {
@@ -479,15 +477,11 @@ impl PdfViewer {
             PdfMessage::PageDown => {
                 let current = self
                     .layout
-                    .center_of_page(&self.doc, self.translation, self.viewport.borrow().clone())
+                    .center_of_page(&self.doc, self.translation, *self.viewport.borrow())
                     .unwrap();
                 let next = self
                     .layout
-                    .center_of_page_below(
-                        &self.doc,
-                        self.translation,
-                        self.viewport.borrow().clone(),
-                    )
+                    .center_of_page_below(&self.doc, self.translation, *self.viewport.borrow())
                     .unwrap();
 
                 self.translation.y += next.center().y - current.center().y;
@@ -495,30 +489,26 @@ impl PdfViewer {
             PdfMessage::PageUp => {
                 let current = self
                     .layout
-                    .center_of_page(&self.doc, self.translation, self.viewport.borrow().clone())
+                    .center_of_page(&self.doc, self.translation, *self.viewport.borrow())
                     .unwrap();
                 let prev = self
                     .layout
-                    .center_of_page_above(
-                        &self.doc,
-                        self.translation,
-                        self.viewport.borrow().clone(),
-                    )
+                    .center_of_page_above(&self.doc, self.translation, *self.viewport.borrow())
                     .unwrap();
 
                 self.translation.y += prev.center().y - current.center().y;
             }
             PdfMessage::SetPage(idx) => {
-                if idx < page_count {
-                    if let Ok(translation) = self.layout.translation_for_page(
+                if idx < page_count
+                    && let Ok(translation) = self.layout.translation_for_page(
                         &self.doc,
                         self.scale,
                         self.fractional_scaling,
                         idx,
-                        self.viewport.borrow().clone(),
-                    ) {
-                        self.translation = translation;
-                    }
+                        *self.viewport.borrow(),
+                    )
+                {
+                    self.translation = translation;
                 }
             }
             PdfMessage::SetTranslation(vector) => {
@@ -632,10 +622,10 @@ impl PdfViewer {
                     match self.mouse_interaction {
                         MouseInteraction::None | MouseInteraction::Panning => {
                             let dist_sq = (self.mouse_pos - self.mouse_pressed_at).norm_squared();
-                            if dist_sq < MIN_CLICK_DISTANCE * MIN_CLICK_DISTANCE {
-                                if let Some((page_idx, link_idx)) = self.hovered_link {
-                                    out = self.activate_link(page_idx, link_idx);
-                                }
+                            if dist_sq < MIN_CLICK_DISTANCE * MIN_CLICK_DISTANCE
+                                && let Some((page_idx, link_idx)) = self.hovered_link
+                            {
+                                out = self.activate_link(page_idx, link_idx);
                             }
                         }
                         MouseInteraction::Selecting => {
@@ -786,63 +776,64 @@ impl PdfViewer {
                     };
 
                     let mut cache = self.render_cache.borrow_mut();
-                    if !cache.contains_key(&key) {
-                        let _span = tracy_client::span!("Pdf cache miss");
+                    let handle = cache
+                        .entry(key)
+                        .or_insert_with(|| {
+                            let _span = tracy_client::span!("Pdf cache miss");
 
-                        // Try to reuse a pixmap allocation for this page.
-                        let mut pool = self.pixmap_pool.borrow_mut();
-                        let mut pix = pool.remove(&i).unwrap_or_else(|| {
-                            Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true).unwrap()
-                        });
+                            // Try to reuse a pixmap allocation for this page.
+                            let mut pool = self.pixmap_pool.borrow_mut();
+                            let mut pix = pool.remove(&i).unwrap_or_else(|| {
+                                Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true).unwrap()
+                            });
 
-                        // If the pooled pixmap has the wrong size, allocate a new one.
-                        if pix.width() as i32 != w || pix.height() as i32 != h {
-                            let _span = tracy_client::span!("Pixmap bounds mismatch");
-                            pix = Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true)
+                            // If the pooled pixmap has the wrong size, allocate a new one.
+                            if pix.width() as i32 != w || pix.height() as i32 != h {
+                                let _span = tracy_client::span!("Pixmap bounds mismatch");
+                                pix = Pixmap::new_with_w_h(&Colorspace::device_rgb(), w, h, true)
+                                    .unwrap();
+                            }
+
+                            pix.samples_mut().fill(255);
+                            let device = Device::from_pixmap(&pix).unwrap();
+                            self.display_lists[i]
+                                .run(&device, &matrix, scissor)
                                 .unwrap();
-                        }
 
-                        pix.samples_mut().fill(255);
-                        let device = Device::from_pixmap(&mut pix).unwrap();
-                        self.display_lists[i]
-                            .run(&device, &matrix, scissor)
-                            .unwrap();
+                            if self.pdf_dark_mode {
+                                cpu_pdf_dark_mode_shader(&mut pix, &self.gradient_cache);
+                            }
 
-                        if self.pdf_dark_mode {
-                            cpu_pdf_dark_mode_shader(&mut pix, &self.gradient_cache);
-                        }
+                            let samples = pix.samples();
 
-                        let samples = pix.samples();
+                            // NOTE: We have to copy the data at least once since the mupdf structures
+                            // NOTE: and their associated data aren't thread safe. Iced could render
+                            // NOTE: them on any thread without my control
 
-                        // NOTE: We have to copy the data at least once since the mupdf structures
-                        // NOTE: and their associated data aren't thread safe. Iced could render
-                        // NOTE: them on any thread without my control
+                            // Try to reuse a CPU buffer from the shared pool.
+                            let mut buf = self
+                                .buffer_pool
+                                .lock()
+                                .unwrap()
+                                .remove(&i)
+                                .and_then(|mut v| v.pop())
+                                .unwrap_or_else(|| Vec::with_capacity(samples.len()));
+                            buf.clear();
+                            buf.extend_from_slice(samples);
+                            // Return the mupdf pixmap to the pool for reuse.
+                            pool.insert(i, pix);
 
-                        // Try to reuse a CPU buffer from the shared pool.
-                        let mut buf = self
-                            .buffer_pool
-                            .lock()
-                            .unwrap()
-                            .remove(&i)
-                            .and_then(|mut v| v.pop())
-                            .unwrap_or_else(|| Vec::with_capacity(samples.len()));
-                        buf.clear();
-                        buf.extend_from_slice(samples);
-                        // Return the mupdf pixmap to the pool for reuse.
-                        pool.insert(i, pix);
-
-                        let handle = image::Handle::from_rgba(
-                            w as u32,
-                            h as u32,
-                            image::Bytes::from_owner(PooledBuffer {
-                                buf: Some(buf),
-                                pool: Arc::downgrade(&self.buffer_pool),
-                                page_idx: i,
-                            }),
-                        );
-                        cache.insert(key, handle);
-                    }
-                    let handle = cache.get(&key).unwrap().clone();
+                            image::Handle::from_rgba(
+                                w as u32,
+                                h as u32,
+                                image::Bytes::from_owner(PooledBuffer {
+                                    buf: Some(buf),
+                                    pool: Arc::downgrade(&self.buffer_pool),
+                                    page_idx: i,
+                                }),
+                            )
+                        })
+                        .clone();
                     (handle, draw_rect)
                 })
                 .collect();
@@ -921,10 +912,10 @@ impl PdfViewer {
                         let quad = ch.quad();
                         let char_rect =
                             mupdf::Rect::new(quad.ul.x, quad.ul.y, quad.lr.x, quad.lr.y);
-                        if rectangles_intersect(pdf_rect, char_rect) {
-                            if let Some(c) = ch.char() {
-                                result.push(c);
-                            }
+                        if rectangles_intersect(pdf_rect, char_rect)
+                            && let Some(c) = ch.char()
+                        {
+                            result.push(c);
                         }
                     }
                     result.push('\n');
@@ -1028,20 +1019,18 @@ impl PdfViewer {
             if page_num < self.doc.page_count().unwrap() as usize {
                 return iced::Task::done(PdfMessage::SetPage(page_num));
             }
-        } else if link.uri.starts_with("#page=") {
-            if let Some(page_str) = link.uri.strip_prefix("#page=") {
-                if let Ok(page_num) = page_str.parse::<usize>() {
-                    if page_num > 0 {
-                        return iced::Task::done(PdfMessage::SetPage(page_num - 1));
-                    }
-                }
+        } else if link.uri.starts_with("#page=")
+            && let Some(page_str) = link.uri.strip_prefix("#page=")
+            && let Ok(page_num) = page_str.parse::<usize>()
+        {
+            if page_num > 0 {
+                return iced::Task::done(PdfMessage::SetPage(page_num - 1));
             }
-        } else if link.uri.chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(page_num) = link.uri.parse::<usize>() {
-                if page_num > 0 {
-                    return iced::Task::done(PdfMessage::SetPage(page_num - 1));
-                }
-            }
+        } else if link.uri.chars().all(|c| c.is_ascii_digit())
+            && let Ok(page_num) = link.uri.parse::<usize>()
+            && page_num > 0
+        {
+            return iced::Task::done(PdfMessage::SetPage(page_num - 1));
         }
 
         iced::Task::none()
@@ -1191,6 +1180,23 @@ fn generate_key_combinations(count: usize) -> Vec<String> {
     keys
 }
 
+/// Returns the pdf background color
+fn get_pdf_background_color(pdf_dark_mode: bool, show_borders: bool) -> iced::Color {
+    if show_borders {
+        if pdf_dark_mode {
+            iced::Color::from_rgb8(21, 22, 32)
+        } else {
+            iced::Color::from_rgb8(220, 219, 218)
+        }
+    } else {
+        if pdf_dark_mode {
+            DARK_THEME.palette().background
+        } else {
+            iced::Color::WHITE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1278,22 +1284,5 @@ mod tests {
         );
 
         Ok(())
-    }
-}
-
-/// Returns the pdf background color
-fn get_pdf_background_color(pdf_dark_mode: bool, show_borders: bool) -> iced::Color {
-    if show_borders {
-        if pdf_dark_mode {
-            iced::Color::from_rgb8(21, 22, 32)
-        } else {
-            iced::Color::from_rgb8(220, 219, 218)
-        }
-    } else {
-        if pdf_dark_mode {
-            DARK_THEME.palette().background
-        } else {
-            iced::Color::WHITE
-        }
     }
 }

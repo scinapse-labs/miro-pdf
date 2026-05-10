@@ -825,6 +825,7 @@ mod tests {
         assert_eq!(config.open_sidebar, default_cfg.open_sidebar);
     }
 
+    #[allow(clippy::bool_assert_comparison)]
     #[test]
     pub fn can_parse_mouse_input() {
         // Test basic mouse buttons
