@@ -412,16 +412,11 @@ pub struct PdfViewer {
 }
 
 impl PdfViewer {
-    pub fn from_path(path: PathBuf) -> Result<Self> {
-        let name = path
-            .file_name()
-            .expect("The pdf must have a file name")
-            .to_string_lossy()
-            .to_string();
-        let doc = mupdf::Document::open(&path.to_str().unwrap())?;
+    fn build_document_data(
+        doc: &mupdf::Document,
+    ) -> Result<(Vec<mupdf::DisplayList>, Vec<Vec<PageLink>>, Vec<OutlineItem>)> {
         let mut display_lists = vec![];
         let mut links = vec![];
-        let outline = Self::extract_outline(&doc).unwrap_or_default();
         for page in doc.pages()?.flatten() {
             let dl = mupdf::DisplayList::new(page.bounds()?)?;
             let dummy_device = Device::from_display_list(&dl)?;
@@ -439,6 +434,18 @@ impl PdfViewer {
                 .collect();
             links.push(page_links);
         }
+        let outline = Self::extract_outline(doc).unwrap_or_default();
+        Ok((display_lists, links, outline))
+    }
+
+    pub fn from_path(path: PathBuf) -> Result<Self> {
+        let name = path
+            .file_name()
+            .expect("The pdf must have a file name")
+            .to_string_lossy()
+            .to_string();
+        let doc = mupdf::Document::open(&path.to_str().unwrap())?;
+        let (display_lists, links, outline) = Self::build_document_data(&doc)?;
 
         let bg_color = DARK_THEME
             .extended_palette()
@@ -672,7 +679,23 @@ impl PdfViewer {
             PdfMessage::CloseLinkHitboxes => {
                 self.show_link_hitboxes = false;
             }
-            PdfMessage::FileChanged => {}
+            PdfMessage::FileChanged => {
+                self.render_cache.borrow_mut().clear();
+                self.pixmap_pool.borrow_mut().clear();
+
+                if let Some(path_str) = self.path.to_str() {
+                    if let Ok(new_doc) = mupdf::Document::open(path_str) {
+                        if let Ok((display_lists, links, outline)) =
+                            Self::build_document_data(&new_doc)
+                        {
+                            self.doc = new_doc;
+                            self.display_lists = display_lists;
+                            self.links = links;
+                            self.outline = outline;
+                        }
+                    }
+                }
+            }
             PdfMessage::PrintPdf => {}
             PdfMessage::None => {}
         }
