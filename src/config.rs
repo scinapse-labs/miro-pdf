@@ -528,11 +528,11 @@ impl Default for Config {
                     BindableMessage::NextPage,
                 ),
                 Keybind::new(
-                    KeyInput::from_str("Ctrl+f").unwrap(),
+                    KeyInput::from_str("Ctrl+b").unwrap(),
                     BindableMessage::PageUp,
                 ),
                 Keybind::new(
-                    KeyInput::from_str("Ctrl+b").unwrap(),
+                    KeyInput::from_str("Ctrl+f").unwrap(),
                     BindableMessage::PageDown,
                 ),
                 Keybind::new(
