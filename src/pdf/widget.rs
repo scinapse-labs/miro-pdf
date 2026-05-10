@@ -10,6 +10,7 @@ use colorgrad::{Gradient as _, GradientBuilder, LinearGradient};
 use iced::{
     Renderer, Size,
     advanced::{graphics::geometry, image},
+    mouse,
     widget::{
         self,
         canvas::{self, Cache, Stroke},
@@ -659,14 +660,12 @@ impl PdfViewer {
                                     let selection_rect = Rect::from_points(min, max);
                                     self.selected_text =
                                         self.extract_text_from_rect(selection_rect);
-                                    debug!("Selected text: {}", self.selected_text);
-                                } else {
-                                    self.selection_start = None;
-                                    self.selection_end = None;
                                 }
                             }
                         }
                     }
+                    self.selection_start = None;
+                    self.selection_end = None;
                     self.mouse_interaction = MouseInteraction::None;
                 }
             }
