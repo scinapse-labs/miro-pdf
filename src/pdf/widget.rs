@@ -550,7 +550,29 @@ impl PdfViewer {
                 self.scale = 1.0;
             }
             PdfMessage::ZoomFit => {
-                self.translation = Vector::zero();
+                let page_idx = self.current_page();
+                if let Some(display_list) = self.display_lists.get(page_idx) {
+                    let page_bounds = display_list.bounds();
+                    let page_width = page_bounds.x1 - page_bounds.x0;
+                    let page_height = page_bounds.y1 - page_bounds.y0;
+                    if page_width > 0.0 && page_height > 0.0 {
+                        let viewport = *self.viewport.borrow();
+                        if viewport.width > 0.0 && viewport.height > 0.0 {
+                            let scale_x = viewport.width / page_width;
+                            let scale_y = viewport.height / page_height;
+                            self.scale = scale_x.min(scale_y) / self.fractional_scaling;
+                            if let Ok(translation) = self.layout.translation_for_page(
+                                &self.doc,
+                                self.scale,
+                                self.fractional_scaling,
+                                page_idx,
+                                viewport,
+                            ) {
+                                self.translation = translation;
+                            }
+                        }
+                    }
+                }
             }
             PdfMessage::Move(vector) => {
                 self.translation += vector;
@@ -1157,6 +1179,89 @@ fn generate_key_combinations(count: usize) -> Vec<String> {
     }
 
     keys
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use super::*;
+
+    #[test]
+    fn test_zoom_fit_scales_current_page_to_viewport() -> Result<()> {
+        let mut viewer = PdfViewer::from_path(PathBuf::from("assets/links.pdf"))?;
+        let viewport = iced::Size::new(800.0, 600.0);
+        viewer.set_viewport_for_test(viewport);
+        viewer.layout = PageLayout::SinglePage;
+
+        // Start on page 0
+        let start_page = viewer.current_page();
+        assert_eq!(start_page, 0);
+
+        let _ = viewer.update(PdfMessage::ZoomFit);
+
+        let page_idx = viewer.current_page();
+        assert_eq!(page_idx, start_page, "ZoomFit should keep the same current page");
+
+        let page_bounds = viewer.display_lists[page_idx].bounds();
+        let page_width = page_bounds.x1 - page_bounds.x0;
+        let page_height = page_bounds.y1 - page_bounds.y0;
+
+        let effective_scale = viewer.scale * viewer.fractional_scaling;
+        let scaled_width = page_width * effective_scale;
+        let scaled_height = page_height * effective_scale;
+
+        assert!(
+            scaled_width <= viewport.width + 1e-3,
+            "Scaled width {} should fit in viewport width {}",
+            scaled_width,
+            viewport.width
+        );
+        assert!(
+            scaled_height <= viewport.height + 1e-3,
+            "Scaled height {} should fit in viewport height {}",
+            scaled_height,
+            viewport.height
+        );
+
+        // The scale should be the largest scale that still fits the page.
+        let scale_x = viewport.width / page_width;
+        let scale_y = viewport.height / page_height;
+        let expected_scale = scale_x.min(scale_y) / viewer.fractional_scaling;
+        assert!(
+            (viewer.scale - expected_scale).abs() < 1e-3,
+            "Expected scale ~{}, got {}",
+            expected_scale,
+            viewer.scale
+        );
+
+        // Verify the page is fully visible by checking its rect.
+        let rects = viewer.layout.pages_rects(
+            &viewer.doc,
+            -viewer.translation,
+            viewer.scale,
+            viewer.fractional_scaling,
+            viewport,
+        )?;
+        let page_rect = rects[page_idx];
+        assert!(
+            page_rect.x0.x >= -1e-3,
+            "Page left edge {} should be inside viewport", page_rect.x0.x
+        );
+        assert!(
+            page_rect.x1.x <= viewport.width + 1e-3,
+            "Page right edge {} should be inside viewport", page_rect.x1.x
+        );
+        assert!(
+            page_rect.x0.y >= -1e-3,
+            "Page top edge {} should be inside viewport", page_rect.x0.y
+        );
+        assert!(
+            page_rect.x1.y <= viewport.height + 1e-3,
+            "Page bottom edge {} should be inside viewport", page_rect.x1.y
+        );
+
+        Ok(())
+    }
 }
 
 /// Returns the pdf background color
