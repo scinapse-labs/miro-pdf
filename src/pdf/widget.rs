@@ -1075,8 +1075,20 @@ impl PdfViewer {
     }
 
     pub fn is_jumpable_action(&self, msg: &PdfMessage) -> bool {
-        // TODO: Implement
-        false
+        match msg {
+            PdfMessage::ActivateLink(index) => {
+                if let Some(link) = self
+                    .links
+                    .get(self.current_page())
+                    .and_then(|p| p.get(*index))
+                {
+                    link.uri.starts_with("#page=")
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     pub fn get_outline(&self) -> &[OutlineItem] {
@@ -1198,7 +1210,10 @@ mod tests {
         let _ = viewer.update(PdfMessage::ZoomFit);
 
         let page_idx = viewer.current_page();
-        assert_eq!(page_idx, start_page, "ZoomFit should keep the same current page");
+        assert_eq!(
+            page_idx, start_page,
+            "ZoomFit should keep the same current page"
+        );
 
         let page_bounds = viewer.display_lists[page_idx].bounds();
         let page_width = page_bounds.x1 - page_bounds.x0;
@@ -1243,19 +1258,23 @@ mod tests {
         let page_rect = rects[page_idx];
         assert!(
             page_rect.x0.x >= -1e-3,
-            "Page left edge {} should be inside viewport", page_rect.x0.x
+            "Page left edge {} should be inside viewport",
+            page_rect.x0.x
         );
         assert!(
             page_rect.x1.x <= viewport.width + 1e-3,
-            "Page right edge {} should be inside viewport", page_rect.x1.x
+            "Page right edge {} should be inside viewport",
+            page_rect.x1.x
         );
         assert!(
             page_rect.x0.y >= -1e-3,
-            "Page top edge {} should be inside viewport", page_rect.x0.y
+            "Page top edge {} should be inside viewport",
+            page_rect.x0.y
         );
         assert!(
             page_rect.x1.y <= viewport.height + 1e-3,
-            "Page bottom edge {} should be inside viewport", page_rect.x1.y
+            "Page bottom edge {} should be inside viewport",
+            page_rect.x1.y
         );
 
         Ok(())
