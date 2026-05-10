@@ -11,8 +11,12 @@ pub mod widget;
 
 #[derive(Debug, Clone, Serialize, Deserialize, EnumString, Default)]
 pub enum PdfMessage {
-    PageDown,
+    NextPage,
+    PreviousPage,
     PageUp,
+    PageDown,
+    HalfPageUp,
+    HalfPageDown,
     SetPage(usize),
     SetTranslation(Vector<f32>),
     /// Translation and scale
@@ -22,6 +26,7 @@ pub enum PdfMessage {
     ZoomOut,
     ZoomHome,
     ZoomFit,
+    /// Move some distance in Document space
     Move(Vector<f32>),
     MouseMoved(Vector<f32>),
     /// A [MouseAction] and whether it's pressed (true) or released (false)

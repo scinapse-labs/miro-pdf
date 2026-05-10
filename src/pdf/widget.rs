@@ -496,7 +496,7 @@ impl PdfViewer {
         let mut out = iced::Task::none();
         let page_count = self.doc.page_count().unwrap() as usize;
         match msg {
-            PdfMessage::PageDown => {
+            PdfMessage::NextPage => {
                 let current = self
                     .layout
                     .center_of_page(&self.doc, self.translation, *self.viewport.borrow())
@@ -508,7 +508,7 @@ impl PdfViewer {
 
                 self.translation.y += next.center().y - current.center().y;
             }
-            PdfMessage::PageUp => {
+            PdfMessage::PreviousPage => {
                 let current = self
                     .layout
                     .center_of_page(&self.doc, self.translation, *self.viewport.borrow())
@@ -616,10 +616,10 @@ impl PdfViewer {
                             self.selected_text.clear();
                         }
                         MouseAction::NextPage => {
-                            out = iced::Task::done(PdfMessage::PageDown);
+                            out = iced::Task::done(PdfMessage::NextPage);
                         }
                         MouseAction::PreviousPage => {
-                            out = iced::Task::done(PdfMessage::PageUp);
+                            out = iced::Task::done(PdfMessage::PreviousPage);
                         }
                         MouseAction::ZoomIn => {
                             out = iced::Task::done(PdfMessage::ZoomIn);
@@ -710,6 +710,34 @@ impl PdfViewer {
                     },
                     |_| PdfMessage::None,
                 );
+            }
+            PdfMessage::PageUp => {
+                let vp = self.viewport.borrow();
+                out = iced::Task::done(PdfMessage::Move(Vector::new(
+                    0.0,
+                    -vp.height / (self.scale * self.fractional_scaling),
+                )));
+            }
+            PdfMessage::PageDown => {
+                let vp = self.viewport.borrow();
+                out = iced::Task::done(PdfMessage::Move(Vector::new(
+                    0.0,
+                    vp.height / (self.scale * self.fractional_scaling),
+                )));
+            }
+            PdfMessage::HalfPageUp => {
+                let vp = self.viewport.borrow();
+                out = iced::Task::done(PdfMessage::Move(Vector::new(
+                    0.0,
+                    -vp.height / (self.scale * self.fractional_scaling * 2.0),
+                )));
+            }
+            PdfMessage::HalfPageDown => {
+                let vp = self.viewport.borrow();
+                out = iced::Task::done(PdfMessage::Move(Vector::new(
+                    0.0,
+                    vp.height / (self.scale * self.fractional_scaling * 2.0),
+                )));
             }
             PdfMessage::None => {}
         }

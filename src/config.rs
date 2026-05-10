@@ -165,6 +165,10 @@ pub enum BindableMessage {
     MoveRight,
     NextPage,
     PreviousPage,
+    PageUp,
+    PageDown,
+    HalfPageUp,
+    HalfPageDown,
     ZoomHome,
     ZoomFit,
     ZoomIn,
@@ -205,8 +209,8 @@ impl From<BindableMessage> for AppMessage {
             BindableMessage::MoveRight => {
                 AppMessage::PdfMessage(PdfMessage::Move(Vector::new(MOVE_STEP, 0.0)))
             }
-            BindableMessage::NextPage => AppMessage::PdfMessage(PdfMessage::PageDown),
-            BindableMessage::PreviousPage => AppMessage::PdfMessage(PdfMessage::PageUp),
+            BindableMessage::NextPage => AppMessage::PdfMessage(PdfMessage::NextPage),
+            BindableMessage::PreviousPage => AppMessage::PdfMessage(PdfMessage::PreviousPage),
             BindableMessage::ZoomHome => AppMessage::PdfMessage(PdfMessage::ZoomHome),
             BindableMessage::ZoomFit => AppMessage::PdfMessage(PdfMessage::ZoomFit),
             BindableMessage::ZoomIn => AppMessage::PdfMessage(PdfMessage::ZoomIn),
@@ -240,6 +244,10 @@ impl From<BindableMessage> for AppMessage {
             BindableMessage::PresentationLayout => {
                 AppMessage::PdfMessage(PdfMessage::SetLayout(PageLayout::Presentation))
             }
+            BindableMessage::PageUp => AppMessage::PdfMessage(PdfMessage::PageUp),
+            BindableMessage::PageDown => AppMessage::PdfMessage(PdfMessage::PageDown),
+            BindableMessage::HalfPageUp => AppMessage::PdfMessage(PdfMessage::HalfPageUp),
+            BindableMessage::HalfPageDown => AppMessage::PdfMessage(PdfMessage::HalfPageDown),
         }
     }
 }
@@ -518,6 +526,22 @@ impl Default for Config {
                 Keybind::new(
                     KeyInput::from_str("PageDown").unwrap(),
                     BindableMessage::NextPage,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("Ctrl+f").unwrap(),
+                    BindableMessage::PageUp,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("Ctrl+b").unwrap(),
+                    BindableMessage::PageDown,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("Ctrl+u").unwrap(),
+                    BindableMessage::HalfPageUp,
+                ),
+                Keybind::new(
+                    KeyInput::from_str("Ctrl+d").unwrap(),
+                    BindableMessage::HalfPageDown,
                 ),
                 Keybind::new(
                     KeyInput::from_str("Alt+Left").unwrap(),
