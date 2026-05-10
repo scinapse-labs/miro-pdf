@@ -1129,17 +1129,8 @@ impl App {
             _ => None,
         });
 
-        // On a window resize the widget should change size, if it doesn't we don't need to
-        // re-allocate a pixmap regardless. Thus this None for now.
-        // TODO: Delete this in the future if we don't need any information about window resizes
-        let resizes = listen_with(|event, _, _| match event {
-            Event::Window(window::Event::Resized(_)) => None,
-            _ => None,
-        });
-
         let mut subs = vec![
             keys,
-            resizes,
             Subscription::run(file_watcher).map(AppMessage::FileWatcher),
         ];
 
