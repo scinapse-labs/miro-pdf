@@ -71,8 +71,6 @@ impl Drop for PooledBuffer {
     }
 }
 
-// TODO(Next): Selection and links
-
 type BufferPool = Arc<Mutex<HashMap<usize, Vec<Vec<u8>>>>>;
 
 /// Cache key for rendered page images.
@@ -125,75 +123,6 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
         let _span = tracy_client::span!("Pdf draw");
         let bg = self.cache.draw(renderer, bounds.size(), |frame| {
             for (handle, rect) in &self.pages {
-                let mut c = iced::Color::WHITE;
-                c.a = 0.2;
-                frame.fill_rectangle((rect.x0).into(), rect.size().into(), c);
-                frame.stroke_rectangle(
-                    (rect.x0).into(),
-                    rect.size().into(),
-                    Stroke::default().with_color(c).with_width(1.0),
-                );
-                frame.fill_rectangle(
-                    (rect.center() - Vector::new(2.0, 2.0)).into(),
-                    iced::Size::new(4.0, 4.0),
-                    iced::Color::from_rgb(0.0, 1.0, 0.0),
-                );
-                frame.fill_text(geometry::Text {
-                    content: format!("({}, {})", rect.x0.x, rect.x0.y),
-                    position: rect.x0.into(),
-                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
-                    size: 12.0.into(),
-                    line_height: widget::text::LineHeight::Relative(1.0),
-                    font: iced::Font::default(),
-                    horizontal_alignment: iced::alignment::Horizontal::Left,
-                    vertical_alignment: iced::alignment::Vertical::Top,
-                    shaping: widget::text::Shaping::Basic,
-                });
-                frame.fill_text(geometry::Text {
-                    content: format!("({}, {})", rect.x1.x, rect.x0.y),
-                    position: Vector::new(rect.x1.x, rect.x0.y).into(),
-                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
-                    size: 12.0.into(),
-                    line_height: widget::text::LineHeight::Relative(1.0),
-                    font: iced::Font::default(),
-                    horizontal_alignment: iced::alignment::Horizontal::Right,
-                    vertical_alignment: iced::alignment::Vertical::Top,
-                    shaping: widget::text::Shaping::Basic,
-                });
-                frame.fill_text(geometry::Text {
-                    content: format!("({}, {})", rect.x0.x, rect.x1.y),
-                    position: Vector::new(rect.x0.x, rect.x1.y).into(),
-                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
-                    size: 12.0.into(),
-                    line_height: widget::text::LineHeight::Relative(1.0),
-                    font: iced::Font::default(),
-                    horizontal_alignment: iced::alignment::Horizontal::Left,
-                    vertical_alignment: iced::alignment::Vertical::Bottom,
-                    shaping: widget::text::Shaping::Basic,
-                });
-                frame.fill_text(geometry::Text {
-                    content: format!("({}, {})", rect.x1.x, rect.x1.y),
-                    position: rect.x1.into(),
-                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
-                    size: 12.0.into(),
-                    line_height: widget::text::LineHeight::Relative(1.0),
-                    font: iced::Font::default(),
-                    horizontal_alignment: iced::alignment::Horizontal::Right,
-                    vertical_alignment: iced::alignment::Vertical::Bottom,
-                    shaping: widget::text::Shaping::Basic,
-                });
-                frame.fill_text(geometry::Text {
-                    content: format!("({}, {})", rect.center().x, rect.center().y),
-                    position: rect.center().into(),
-                    color: iced::Color::from_rgb(0.0, 1.0, 0.0),
-                    size: 12.0.into(),
-                    line_height: widget::text::LineHeight::Relative(1.0),
-                    font: iced::Font::default(),
-                    horizontal_alignment: iced::alignment::Horizontal::Left,
-                    vertical_alignment: iced::alignment::Vertical::Top,
-                    shaping: widget::text::Shaping::Basic,
-                });
-
                 let bounds: iced::Rectangle = (*rect).into();
                 frame.draw_image(bounds, handle);
             }
@@ -1206,12 +1135,4 @@ fn generate_key_combinations(count: usize) -> Vec<String> {
     }
 
     keys
-}
-
-fn get_background_color(invert_colors: bool) -> iced::Color {
-    if invert_colors {
-        iced::Color::from_rgb8(21, 22, 32)
-    } else {
-        iced::Color::from_rgb8(220, 219, 218)
-    }
 }
