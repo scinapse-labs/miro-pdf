@@ -17,13 +17,14 @@ use iced::{
 };
 
 use mupdf::{Colorspace, Device, Matrix, Pixmap};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::{
     DARK_THEME,
     config::{MOVE_STEP, MouseAction},
     geometry::{Rect, Vector},
-    pdf::{PdfMessage, outline_extraction::OutlineItem, page_layout::PageLayout},
+    pdf::{PdfMessage, page_layout::PageLayout},
 };
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,14 @@ struct PageLink {
     bounds: mupdf::Rect,
     uri: String,
     dest: Option<mupdf::link::LinkDestination>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlineItem {
+    pub title: String,
+    pub page: Option<u32>,
+    pub level: u32,
+    pub children: Vec<OutlineItem>,
 }
 
 const MIN_SELECTION: f32 = 5.0;
@@ -285,9 +294,7 @@ impl<'a> widget::canvas::Program<PdfMessage> for LinkOverlay<'a> {
         state.was_active = true;
 
         if let canvas::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key,
-            modifiers,
-            ..
+            key, modifiers, ..
         }) = event
         {
             if modifiers.control() || modifiers.alt() || modifiers.logo() {
@@ -465,6 +472,8 @@ pub struct PdfViewer {
     links: Vec<Vec<PageLink>>,
     hovered_link: Option<(usize, usize)>,
 
+    outline: Vec<OutlineItem>,
+
     /// The widget's position in window coordinates, updated each frame by the overlay draw.
     widget_position: RefCell<iced::Point>,
 }
@@ -479,6 +488,7 @@ impl PdfViewer {
         let doc = mupdf::Document::open(&path.to_str().unwrap())?;
         let mut display_lists = vec![];
         let mut links = vec![];
+        let outline = Self::extract_outline(&doc).unwrap_or_default();
         for page in doc.pages()?.flatten() {
             let dl = mupdf::DisplayList::new(page.bounds()?)?;
             let dummy_device = Device::from_display_list(&dl)?;
@@ -531,6 +541,7 @@ impl PdfViewer {
             show_link_hitboxes: false,
             links,
             hovered_link: None,
+            outline,
             widget_position: RefCell::new(iced::Point::new(0.0, 0.0)),
         })
     }
@@ -672,8 +683,7 @@ impl PdfViewer {
                 } else {
                     match self.mouse_interaction {
                         MouseInteraction::None | MouseInteraction::Panning => {
-                            let dist_sq =
-                                (self.mouse_pos - self.mouse_pressed_at).norm_squared();
+                            let dist_sq = (self.mouse_pos - self.mouse_pressed_at).norm_squared();
                             if dist_sq < MIN_CLICK_DISTANCE * MIN_CLICK_DISTANCE {
                                 if let Some((page_idx, link_idx)) = self.hovered_link {
                                     out = self.activate_link(page_idx, link_idx);
@@ -904,14 +914,10 @@ impl PdfViewer {
             .width(iced::Length::Fill)
             .height(iced::Length::Fill);
 
-        widget::Stack::with_children([
-            pages.into(),
-            selection_overlay.into(),
-            link_overlay.into(),
-        ])
-        .width(iced::Length::Fill)
-        .height(iced::Length::Fill)
-        .into()
+        widget::Stack::with_children([pages.into(), selection_overlay.into(), link_overlay.into()])
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
     }
 
     pub fn extract_text_from_rect(&self, screen_rect: Rect<f32>) -> String {
@@ -1110,8 +1116,29 @@ impl PdfViewer {
     }
 
     pub fn get_outline(&self) -> &[OutlineItem] {
-        // TODO: Implement
-        &[]
+        &self.outline
+    }
+
+    fn extract_outline(doc: &mupdf::Document) -> Result<Vec<OutlineItem>> {
+        let outlines = doc.outlines()?;
+        let mut items = Vec::new();
+        for outline in &outlines {
+            items.push(Self::convert_outline(outline, 0)?);
+        }
+        Ok(items)
+    }
+
+    fn convert_outline(outline: &mupdf::Outline, level: u32) -> Result<OutlineItem> {
+        let mut children = Vec::new();
+        for child in &outline.down {
+            children.push(Self::convert_outline(child, level + 1)?);
+        }
+        Ok(OutlineItem {
+            title: outline.title.clone(),
+            page: outline.dest.map(|d| d.loc.page_number),
+            level,
+            children,
+        })
     }
 
     pub fn page_progress(&self) -> &str {

@@ -6,7 +6,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use strum::EnumString;
 
-pub mod outline_extraction;
 pub mod page_layout;
 pub mod widget;
 

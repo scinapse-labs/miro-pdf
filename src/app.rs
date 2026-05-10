@@ -39,7 +39,7 @@ use crate::{
     icons,
     jumplist::{JumpLocation, Jumplist},
     pdf::{
-        PdfMessage, outline_extraction::OutlineItem, page_layout::PageLayout, widget::PdfViewer,
+        PdfMessage, page_layout::PageLayout, widget::{OutlineItem, PdfViewer},
     },
     recent_files::RecentFiles,
     rpc::rpc_server,
