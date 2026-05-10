@@ -39,7 +39,9 @@ use crate::{
     icons,
     jumplist::{JumpLocation, Jumplist},
     pdf::{
-        PdfMessage, page_layout::PageLayout, widget::{OutlineItem, PdfViewer},
+        PdfMessage,
+        page_layout::PageLayout,
+        widget::{OutlineItem, PdfViewer},
     },
     recent_files::RecentFiles,
     rpc::rpc_server,
@@ -223,7 +225,7 @@ impl App {
                 let out = match PdfViewer::from_path(path_buf.clone()) {
                     Ok(mut viewer) => {
                         viewer.set_scale_factor(self.scale_factor);
-                        viewer.set_invert_colors(self.invert_pdf);
+                        viewer.set_pdf_dark_mode(self.invert_pdf);
                         self.pdfs.push(viewer);
                         iced::Task::done(AppMessage::OpenTab(self.pdfs.len() - 1))
                     }
@@ -337,12 +339,15 @@ impl App {
             }
             AppMessage::ToggleDarkModeUi => {
                 self.dark_mode = !self.dark_mode;
+                for pdf in &mut self.pdfs {
+                    pdf.set_interface_dark_mode(self.invert_pdf);
+                }
                 iced::Task::none()
             }
             AppMessage::ToggleDarkModePdf => {
                 self.invert_pdf = !self.invert_pdf;
                 for pdf in &mut self.pdfs {
-                    pdf.set_invert_colors(self.invert_pdf);
+                    pdf.set_pdf_dark_mode(self.invert_pdf);
                 }
                 iced::Task::none()
             }

@@ -89,6 +89,8 @@ enum RenderKey {
 struct Document {
     cache: Cache,
     pages: Vec<(image::Handle, Rect<f32>)>,
+    draw_page_borders: bool,
+    pdf_dark_mode: bool,
 }
 
 impl std::fmt::Debug for Document {
@@ -101,10 +103,16 @@ impl std::fmt::Debug for Document {
 }
 
 impl Document {
-    pub fn new(pages: Vec<(image::Handle, Rect<f32>)>) -> Self {
+    pub fn new(
+        pages: Vec<(image::Handle, Rect<f32>)>,
+        draw_page_borders: bool,
+        pdf_dark_mode: bool,
+    ) -> Self {
         Self {
             cache: Cache::default(),
             pages,
+            draw_page_borders,
+            pdf_dark_mode,
         }
     }
 }
@@ -122,6 +130,9 @@ impl<'a> widget::canvas::Program<PdfMessage> for Document {
     ) -> Vec<canvas::Geometry<Renderer>> {
         let _span = tracy_client::span!("Pdf draw");
         let bg = self.cache.draw(renderer, bounds.size(), |frame| {
+            let bg_color = get_pdf_background_color(self.pdf_dark_mode, self.draw_page_borders);
+            frame.fill_rectangle(iced::Point::new(0.0, 0.0), bounds.size(), bg_color);
+
             for (handle, rect) in &self.pages {
                 let bounds: iced::Rectangle = (*rect).into();
                 frame.draw_image(bounds, handle);
@@ -366,7 +377,8 @@ pub struct PdfViewer {
     pub name: String,
     pub path: PathBuf,
 
-    invert_colors: bool,
+    pdf_dark_mode: bool,
+    interface_dark_mode: bool,
     pub draw_page_borders: bool,
 
     doc: mupdf::Document,
@@ -448,7 +460,8 @@ impl PdfViewer {
         Ok(PdfViewer {
             name,
             path,
-            invert_colors: false,
+            pdf_dark_mode: false,
+            interface_dark_mode: false,
             draw_page_borders: true,
             doc,
             display_lists,
@@ -789,7 +802,7 @@ impl PdfViewer {
                             .run(&device, &matrix, scissor)
                             .unwrap();
 
-                        if self.invert_colors {
+                        if self.pdf_dark_mode {
                             cpu_pdf_dark_mode_shader(&mut pix, &self.gradient_cache);
                         }
 
@@ -829,10 +842,14 @@ impl PdfViewer {
                 })
                 .collect();
 
-            widget::canvas(Document::new(with_handles))
-                .width(iced::Length::Fill)
-                .height(iced::Length::Fill)
-                .into()
+            widget::canvas(Document::new(
+                with_handles,
+                self.draw_page_borders,
+                self.pdf_dark_mode,
+            ))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
         });
 
         let selection_overlay = widget::canvas(SelectionOverlay::new(self))
@@ -1032,9 +1049,16 @@ impl PdfViewer {
         self.fractional_scaling = scale_factor as f32;
     }
 
-    pub fn set_invert_colors(&mut self, invert_colors: bool) {
-        if self.invert_colors != invert_colors {
-            self.invert_colors = invert_colors;
+    pub fn set_pdf_dark_mode(&mut self, dark_mode_enabled: bool) {
+        if self.pdf_dark_mode != dark_mode_enabled {
+            self.pdf_dark_mode = dark_mode_enabled;
+            self.render_cache.borrow_mut().clear();
+        }
+    }
+
+    pub fn set_interface_dark_mode(&mut self, dark_mode_enabled: bool) {
+        if self.interface_dark_mode != dark_mode_enabled {
+            self.interface_dark_mode = dark_mode_enabled;
             self.render_cache.borrow_mut().clear();
         }
     }
@@ -1135,4 +1159,21 @@ fn generate_key_combinations(count: usize) -> Vec<String> {
     }
 
     keys
+}
+
+/// Returns the pdf background color
+fn get_pdf_background_color(pdf_dark_mode: bool, show_borders: bool) -> iced::Color {
+    if show_borders {
+        if pdf_dark_mode {
+            iced::Color::from_rgb8(21, 22, 32)
+        } else {
+            iced::Color::from_rgb8(220, 219, 218)
+        }
+    } else {
+        if pdf_dark_mode {
+            DARK_THEME.palette().background
+        } else {
+            iced::Color::WHITE
+        }
+    }
 }
