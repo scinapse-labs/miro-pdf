@@ -18,7 +18,7 @@ use iced::{
 
 use mupdf::{Colorspace, Device, Matrix, Pixmap};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::{
     DARK_THEME,
@@ -414,7 +414,11 @@ pub struct PdfViewer {
 impl PdfViewer {
     fn build_document_data(
         doc: &mupdf::Document,
-    ) -> Result<(Vec<mupdf::DisplayList>, Vec<Vec<PageLink>>, Vec<OutlineItem>)> {
+    ) -> Result<(
+        Vec<mupdf::DisplayList>,
+        Vec<Vec<PageLink>>,
+        Vec<OutlineItem>,
+    )> {
         let mut display_lists = vec![];
         let mut links = vec![];
         for page in doc.pages()?.flatten() {
@@ -696,7 +700,18 @@ impl PdfViewer {
                     }
                 }
             }
-            PdfMessage::PrintPdf => {}
+            PdfMessage::PrintPdf => {
+                let path = self.path.clone();
+                out = iced::Task::perform(
+                    async move {
+                        let file_url = format!("file://{}", path.to_string_lossy());
+                        if let Err(e) = webbrowser::open(&file_url) {
+                            error!("Failed to open PDF in default browser: {}", e);
+                        }
+                    },
+                    |_| PdfMessage::None,
+                );
+            }
             PdfMessage::None => {}
         }
         out
