@@ -46,6 +46,11 @@ const MIN_SELECTION: f32 = 5.0;
 const MIN_CLICK_DISTANCE: f32 = 5.0;
 
 /// A pixel buffer that returns itself to a shared pool when dropped.
+///
+/// Allocation pressure is the motivating concern: a single 4K page at 2× scale
+/// is ~64 MiB of RGBA data. Doing that per frame during zoom or pan causes
+/// severe allocator churn, so the pool turns allocation into zero-cost reuse
+/// after warmup.
 #[derive(Debug)]
 struct PooledBuffer {
     buf: Option<Vec<u8>>,
@@ -61,6 +66,8 @@ impl AsRef<[u8]> for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
+        // Returning the buffer on Drop lets us recycle the allocation without
+        // forcing callers to manage a manual release path.
         if let Some(buf) = self.buf.take()
             && let Some(pool) = self.pool.upgrade()
             && let Ok(mut pool) = pool.lock()
@@ -365,12 +372,15 @@ pub struct PdfViewer {
 
     doc: mupdf::Document,
     display_lists: Vec<mupdf::DisplayList>,
-    /// Exact render cache: key includes visible rect for partial renders.
+    /// Final iced image handles cached by render key. Kept separately so iced can reuse the
+    /// GPU texture without re-uploading when the widget redraws for non-visual reasons.
     render_cache: RefCell<HashMap<RenderKey, image::Handle>>,
-    /// Reusable mupdf pixmaps (one per page). Only the most recent size is kept.
+    /// Reusable MuPDF pixmaps keyed by page. These are expensive to allocate and are not Send,
+    /// so we pool them separately from the plain CPU buffers.
     pixmap_pool: RefCell<HashMap<usize, Pixmap>>,
-    /// Shared pool of CPU buffers returned by dropped images. These can be shared across threads and
-    /// are sent to iced.
+    /// Plain CPU buffers returned by dropped images and shared across threads. MuPDF data is not
+    /// thread-safe, but iced may render on any thread, so we must copy into a Vec<u8> and pool
+    /// it to avoid allocating multi-megabyte buffers on every frame during zoom or pan.
     buffer_pool: BufferPool,
 
     pub translation: Vector<f32>,
@@ -734,9 +744,12 @@ impl PdfViewer {
                         let render_offset_x = rect_ss.x0.x - vis.x0.x;
                         let render_offset_y = rect_ss.x0.y - vis.x0.y;
 
-                        // Round to integer pixels for the cache key. The
-                        // matrix uses the snapped value; the draw position is
-                        // adjusted by the rounding error so they stay in sync.
+                        // During a smooth pan the translation changes by sub-pixel amounts every
+                        // frame. Using raw floats as a cache key would force a full re-render on
+                        // every mouse event because the key would differ each time. We snap the
+                        // offset to whole pixels so the cached image survives small pans, and
+                        // compensate the draw rectangle by the rounding error so the visual
+                        // position stays accurate without paying the render cost.
                         let snapped_offset_x = render_offset_x.round();
                         let snapped_offset_y = render_offset_y.round();
 
@@ -794,6 +807,10 @@ impl PdfViewer {
                                     .unwrap();
                             }
 
+                            // MuPDF only overwrites pixels actually touched by page content.
+                            // Margins or transparent regions would keep stale data from the
+                            // previous pool user (or be uninitialized). Filling with white
+                            // guarantees the paper background that PDFs assume.
                             pix.samples_mut().fill(255);
                             let device = Device::from_pixmap(&pix).unwrap();
                             self.display_lists[i]
@@ -856,6 +873,9 @@ impl PdfViewer {
             .width(iced::Length::Fill)
             .height(iced::Length::Fill);
 
+        // We need the stack here because an image being drawn inside a canvas appears on top of
+        // shapes regardless of draw order. This way we force the draw order to allow for
+        // shapes to overlay images.
         widget::Stack::with_children([pages.into(), selection_overlay.into(), link_overlay.into()])
             .width(iced::Length::Fill)
             .height(iced::Length::Fill)
